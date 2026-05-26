@@ -6,8 +6,11 @@ local input_window = require('opencode.ui.input_window')
 local float_layout = require('opencode.ui.float_layout')
 local footer = require('opencode.ui.footer')
 local topbar = require('opencode.ui.topbar')
+local background_indicator = require('opencode.ui.background_indicator')
 
 local M = {}
+
+background_indicator.setup()
 
 ---Capture cursor positions from both windows for snapshot
 ---@param windows OpencodeWindowState

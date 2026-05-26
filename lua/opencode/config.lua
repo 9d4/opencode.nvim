@@ -158,6 +158,14 @@ M.defaults = {
     loading_animation = {
       frames = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' },
     },
+    background_indicator = {
+      enabled = true,
+      offset = {
+        row = 0,
+        col = 1,
+      },
+      max_width = 60,
+    },
     output = {
       filetype = 'opencode_output',
       time_format = nil,
