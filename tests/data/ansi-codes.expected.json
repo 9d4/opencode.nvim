@@ -22,7 +22,10 @@
             "OpencodeMessageRoleAssistant"
           ],
           [
-            " claude-sonnet-4.5",
+            " "
+          ],
+          [
+            "github-copilot/claude-sonnet-4.5",
             "OpencodeHint"
           ],
           [
@@ -8568,5 +8571,14 @@
     "",
     ""
   ],
-  "timestamp": 1770935234
+  "timestamp": 1770935234,
+  "window": {
+    "cursor": [
+      409,
+      0
+    ],
+    "effective_bottom": 409,
+    "line_count": 410,
+    "visible_bottom": 410
+  }
 }

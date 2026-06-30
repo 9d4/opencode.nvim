@@ -188,6 +188,7 @@ function M.on_message_updated(message, revert_index)
 
   local rendered_message = ctx.render_state:get_message(msg.info.id)
   local found_msg = rendered_message and rendered_message.message or find_message_in_state(msg.info.id)
+  local found_before = found_msg ~= nil
 
   if revert_index then
     if not found_msg then
@@ -228,7 +229,10 @@ function M.on_message_updated(message, revert_index)
 
   if msg.info.role == 'user' then
     state.renderer.set_last_user_message(msg)
-    scroll(true)
+    if not found_before then
+      local local_submit_pending = (state.user_message_count or {})[msg.info.sessionID] or 0
+      scroll(local_submit_pending > 0)
+    end
   end
 
   update_stats(msg)
@@ -330,6 +334,24 @@ function M.on_part_updated(properties, revert_index)
     end
   end
 
+  -- Preserve state.input when the update omits it. MCP tool completion
+  -- events sometimes arrive with an empty input table, clobbering the
+  -- call arguments from the earlier running event.
+  if part.state and part.state.input and type(part.state.input) == 'table' and next(part.state.input) == nil then
+    local old_input = nil
+    if existing_part_index then
+      old_input = message.parts[existing_part_index]
+        and message.parts[existing_part_index].state
+        and message.parts[existing_part_index].state.input
+    end
+    if not old_input and part_data and part_data.part then
+      old_input = part_data.part.state and part_data.part.state.input
+    end
+    if type(old_input) == 'table' and next(old_input) ~= nil then
+      part.state.input = old_input
+    end
+  end
+
   -- Update the part reference in the message
   if is_new_part then
     if existing_part_index then
@@ -403,6 +425,10 @@ function M.on_part_updated(properties, revert_index)
     end
   else
     flush.mark_part_dirty(part.id, part.messageID)
+  end
+
+  if part.type == 'compaction' then
+    flush.mark_message_dirty(part.messageID)
   end
 
   -- File / agent mentions: re-render the text part to highlight them
@@ -481,9 +507,19 @@ function M.on_session_updated(properties)
   end
 end
 
----Handle session.compacted
-function M.on_session_compacted()
+---@param properties {sessionID: string}|nil
+function M.on_session_compacted(properties)
+  if
+    properties
+    and properties.sessionID
+    and state.active_session
+    and properties.sessionID ~= state.active_session.id
+  then
+    return
+  end
+
   vim.notify('Session has been compacted')
+  require('opencode.ui.renderer').render_full_session()
 end
 
 ---Handle session.error
@@ -503,10 +539,6 @@ function M.on_permission_updated(permission)
   if not permission or not permission.id then
     return
   end
-
-  local tool = permission.tool
-  local callID = tool and tool.callID or permission.callID
-  local messageID = tool and tool.messageID or permission.messageID
 
   if not state.pending_permissions then
     state.renderer.set_pending_permissions({})
@@ -546,13 +578,6 @@ function M.on_permission_replied(properties)
 
   permission_window.remove_permission(permission_id)
   state.renderer.set_pending_permissions(vim.deepcopy(permission_window.get_all_permissions()))
-
-  if #state.pending_permissions == 0 then
-    flush.queue_part_removal('permission-display-part')
-    flush.queue_message_removal('permission-display-message')
-  else
-    M.render_permissions_display()
-  end
 end
 
 ---Handle question.asked — show the question picker UI
@@ -561,7 +586,12 @@ function M.on_question_asked(properties)
   if not properties or not properties.id or not properties.questions then
     return
   end
-  require('opencode.ui.question_window').show_question(properties)
+  local question_window = require('opencode.ui.question_window')
+  question_window.show_question(properties)
+end
+
+function M.on_question_replied()
+  M.clear_question_display()
 end
 
 ---Handle file.edited — reload buffers and fire the hook

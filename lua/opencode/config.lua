@@ -13,6 +13,7 @@ M.defaults = {
   default_system_prompt = nil,
   keymap_prefix = '<leader>o',
   opencode_executable = 'opencode',
+  lock_session_to_directory = false,
   server = {
     url = nil,
     port = nil,
@@ -68,9 +69,13 @@ M.defaults = {
       ['<C-c>'] =       { 'cancel',                                            desc = 'Cancel running request' },
       [']]']   =        { 'next_message',                                      desc = 'Go to next message' },
       ['[[']   =        { 'prev_message',                                      desc = 'Go to previous message' },
+      [']u']   =        { 'next_user_message',                                 desc = 'Go to next user message' },
+      ['[u']   =        { 'prev_user_message',                                 desc = 'Go to previous user message' },
       ['<tab>'] =       { 'toggle_pane',                  mode = { 'n' },      desc = 'Toggle input/output panes' },
       ['i']     =       { 'focus_input',                                       desc = 'Focus input window' },
       ['gr']    =       { 'references',                                        desc = 'Browse code references' },
+      ['gf']    =       { 'jump_to_file',                                       desc = 'Jump to file at cursor' },
+      ['<CR>']  =       { 'jump_to_target_at_cursor',                          desc = 'Jump to target at cursor' },
       ['<M-i>'] =       { 'toggle_input',                 mode = { 'n' },      desc = 'Toggle input window' },
       ['<M-r>'] =       { 'cycle_variant',                mode = { 'n' },      desc = 'Cycle model variants' },
       ['<leader>oS'] =  { 'navigate_session_tree', { 'child', 'picker' },     desc = 'Select child session' },
@@ -108,6 +113,7 @@ M.defaults = {
       rename_session = { '<C-r>',                                              desc = 'Rename selected session' },
       delete_session = { '<C-d>',                                              desc = 'Delete selected sessions' },
       new_session =    { '<C-s>',                                              desc = 'Create a new session' },
+      fork_session =  { '<C-f>',                                              desc = 'Fork selected session' },
     },
     timeline_picker = {
       undo = { '<C-u>',                                   mode = { 'i', 'n' }, desc = 'Undo to selected message' },
@@ -194,6 +200,7 @@ M.defaults = {
         show_output = true,
         show_reasoning_output = true,
         use_folds = true,
+        fold_exclude = { { server = 'sequential-thinking', tool = 'sequentialthinking' } },
         -- Reduced default threshold to make small tool outputs foldable by default.
         -- Users can override this in their config if they prefer the previous value.
         folding_threshold = 25,
@@ -314,6 +321,8 @@ M.defaults = {
     },
   },
   prompt_guard = nil,
+  child_readonly = true,
+  snapshot_path = nil,
   hooks = {
     on_file_edited = nil,
     on_session_loaded = nil,

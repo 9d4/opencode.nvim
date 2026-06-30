@@ -22,6 +22,9 @@
             "OpencodeMessageRoleUser"
           ],
           [
+            " "
+          ],
+          [
             "",
             "OpencodeHint"
           ],
@@ -116,7 +119,10 @@
             "OpencodeMessageRoleAssistant"
           ],
           [
-            " claude-sonnet-4-5",
+            " "
+          ],
+          [
+            "anthropic/claude-sonnet-4-5",
             "OpencodeHint"
           ],
           [
@@ -163,6 +169,14 @@
     "",
     ""
   ],
-  "timestamp": 1773091221
+  "timestamp": 1773091221,
+  "window": {
+    "cursor": [
+      10,
+      0
+    ],
+    "effective_bottom": 10,
+    "line_count": 11,
+    "visible_bottom": 11
+  }
 }
-

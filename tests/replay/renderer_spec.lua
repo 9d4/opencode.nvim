@@ -9,6 +9,46 @@ local config = require('opencode.config')
 local function assert_output_matches(expected, actual, name)
   local normalized_extmarks = helpers.normalize_namespace_ids(actual.extmarks)
 
+  local function legacy_effective_bottom(window)
+    if not window or not window.cursor or not window.line_count then
+      return nil
+    end
+
+    if window.cursor[1] == window.line_count - 1 then
+      return window.line_count - 1
+    end
+
+    return window.line_count
+  end
+
+  local function visible_bottom_equivalent(expected_window, actual_window)
+    if expected_window.visible_bottom == actual_window.visible_bottom then
+      return true
+    end
+
+    if expected_window.effective_bottom == nil or actual_window.effective_bottom == nil then
+      return false
+    end
+
+    if not vim.deep_equal(expected_window.cursor, actual_window.cursor) then
+      return false
+    end
+
+    if expected_window.effective_bottom ~= actual_window.effective_bottom then
+      return false
+    end
+
+    if expected_window.cursor[1] ~= expected_window.effective_bottom then
+      return false
+    end
+
+    -- line('w$') can differ by one wrapped/padding row between event replay and
+    -- bulk full-session render even when both windows are following the same
+    -- effective bottom line.
+    return math.abs(expected_window.visible_bottom - expected_window.effective_bottom) <= 1
+      and math.abs(actual_window.visible_bottom - actual_window.effective_bottom) <= 1
+  end
+
   assert.are.equal(
     #expected.lines,
     #actual.lines,
@@ -90,25 +130,56 @@ local function assert_output_matches(expected, actual, name)
       )
     )
   end
+
+  if expected.window then
+    local actual_window = actual.window or {}
+    assert.are.same(expected.window.cursor, actual_window.cursor, 'Window cursor mismatch')
+    assert.are.same(expected.window.line_count, actual_window.line_count, 'Window line_count mismatch')
+
+    local expected_has_effective_bottom = expected.window.effective_bottom ~= nil
+    if expected_has_effective_bottom then
+      assert.are.same(
+        expected.window.effective_bottom,
+        actual_window.effective_bottom,
+        'Window effective_bottom mismatch'
+      )
+      assert.is_true(
+        visible_bottom_equivalent(expected.window, actual_window),
+        string.format(
+          'Window visible_bottom mismatch: expected %s, got %s (effective_bottom=%s)',
+          vim.inspect(expected.window.visible_bottom),
+          vim.inspect(actual_window.visible_bottom),
+          vim.inspect(expected.window.effective_bottom)
+        )
+      )
+    else
+      local expected_visible_bottom = expected.window.visible_bottom
+      local actual_visible_bottom = actual_window.visible_bottom
+      local expected_effective_bottom = legacy_effective_bottom(expected.window)
+      local matches_legacy_bottom_follow = actual_visible_bottom == expected_visible_bottom
+        or actual_visible_bottom == expected_effective_bottom
+
+      assert.is_true(
+        matches_legacy_bottom_follow,
+        string.format(
+          'Window visible_bottom mismatch: expected %s, got %s (legacy effective_bottom=%s)',
+          vim.inspect(expected_visible_bottom),
+          vim.inspect(actual_visible_bottom),
+          vim.inspect(expected_effective_bottom)
+        )
+      )
+    end
+  end
 end
 
 describe('renderer unit tests', function()
-  local event_subscriptions = {
-    'session.updated',
-    'session.compacted',
-    'session.error',
-    'message.updated',
-    'message.removed',
-    'message.part.updated',
-    'message.part.removed',
-    'permission.updated',
-    'permission.replied',
-    'question.replied',
-    'question.asked',
-    'file.edited',
-    'custom.restore_point.created',
-    'custom.emit_events.finished',
-  }
+  local function event_subscriptions()
+    local names = {}
+    for _, sub in ipairs(require('opencode.ui.renderer').event_subscriptions()) do
+      table.insert(names, sub[1])
+    end
+    return names
+  end
 
   before_each(function()
     require('opencode.event_manager').setup()
@@ -122,7 +193,7 @@ describe('renderer unit tests', function()
 
     renderer.setup_subscriptions()
 
-    for _, event_name in ipairs(event_subscriptions) do
+    for _, event_name in ipairs(event_subscriptions()) do
       assert.is_true(
         event_manager.events[event_name] ~= nil,
         string.format('Renderer did not subscribe to event: %s', event_name)
@@ -138,12 +209,53 @@ describe('renderer unit tests', function()
 
     renderer.setup_subscriptions(false)
 
-    for _, event_name in ipairs(event_subscriptions) do
+    for _, event_name in ipairs(event_subscriptions()) do
       assert.is_true(
         vim.tbl_isempty(event_manager.events[event_name]),
         string.format('Renderer did not unsubscribe from event: %s', event_name)
       )
     end
+  end)
+
+  it('captures stable output window state', function()
+    helpers.replay_setup()
+
+    output_window.set_lines({ 'one', 'two', 'three' })
+    vim.api.nvim_win_set_cursor(state.windows.output_win, { 2, 0 })
+
+    local actual = helpers.capture_output(state.windows.output_buf, output_window.namespace)
+    local window_keys = vim.tbl_keys(actual.window)
+    table.sort(window_keys)
+
+    assert.are.same({ 'cursor', 'effective_bottom', 'line_count', 'visible_bottom' }, window_keys)
+    assert.are.same({ 2, 0 }, actual.window.cursor)
+    assert.are.equal(3, actual.window.visible_bottom)
+    assert.are.equal(3, actual.window.line_count)
+    assert.are.equal(3, actual.window.effective_bottom)
+
+    local existing_file = vim.fn.tempname()
+    local file = assert(io.open(existing_file, 'w'))
+    file:write(vim.json.encode({ timestamp = 123 }))
+    file:close()
+
+    local snapshot = helpers.output_snapshot(state.windows.output_buf, output_window.namespace, existing_file)
+    vim.fn.delete(existing_file)
+
+    assert.are.equal(123, snapshot.timestamp)
+    assert.are.same(actual.window, snapshot.window)
+
+    local existing_without_timestamp = vim.fn.tempname()
+    file = assert(io.open(existing_without_timestamp, 'w'))
+    file:write(vim.json.encode({ lines = {} }))
+    file:close()
+
+    local snapshot_without_timestamp =
+      helpers.output_snapshot(state.windows.output_buf, output_window.namespace, existing_without_timestamp)
+    vim.fn.delete(existing_without_timestamp)
+
+    assert.is_nil(snapshot_without_timestamp.timestamp)
+
+    ui.close_windows(state.windows)
   end)
 
   it('updates active session title from session.updated event', function()
@@ -195,6 +307,24 @@ describe('renderer unit tests', function()
     render_stub:revert()
   end)
 
+  it('refreshes the full session when compacted', function()
+    local renderer = require('opencode.ui.renderer')
+    local events = require('opencode.ui.renderer.events')
+
+    state.session.set_active({
+      id = 'ses_123',
+      title = 'Session',
+      time = { created = 1, updated = 1 },
+    })
+
+    local render_stub = stub(renderer, 'render_full_session')
+
+    events.on_session_compacted()
+
+    assert.stub(render_stub).was_called(1)
+    render_stub:revert()
+  end)
+
   it('inserts a single synthetic revert message during full session render', function()
     local renderer = require('opencode.ui.renderer')
 
@@ -223,6 +353,53 @@ describe('renderer unit tests', function()
     end, state.messages or {})
 
     assert.are.equal(1, #revert_messages)
+  end)
+
+  it('supports output target navigation from a replayed assistant file reference', function()
+    local renderer = require('opencode.ui.renderer')
+    local navigation = require('opencode.ui.navigation')
+
+    helpers.replay_setup()
+
+    local code_buf = vim.api.nvim_create_buf(false, true)
+    local code_win = vim.api.nvim_open_win(code_buf, false, {
+      relative = 'editor',
+      width = 40,
+      height = 8,
+      row = 0,
+      col = 0,
+    })
+
+    state.ui.set_last_code_window(code_win)
+    local path = 'lua/opencode/ui/navigation.lua'
+    local events = helpers.load_test_data('tests/data/output-target-navigation.json')
+    state.session.set_active(helpers.get_session_from_events(events, true))
+    local session_data = helpers.load_session_from_events(events)
+    renderer._render_full_session_data(session_data)
+
+    local lines = vim.api.nvim_buf_get_lines(state.windows.output_buf, 0, -1, false)
+    local target_line, target_col
+    for idx, line in ipairs(lines) do
+      local col = line:find(path, 1, true)
+      if col then
+        target_line = idx
+        target_col = col - 1
+        break
+      end
+    end
+
+    assert.is_not_nil(target_line, 'replayed output did not contain file reference')
+    vim.api.nvim_set_current_win(state.windows.output_win)
+    vim.api.nvim_win_set_cursor(state.windows.output_win, { target_line, target_col })
+
+    navigation.jump_to_target_at_cursor()
+
+    assert.equals(code_win, vim.api.nvim_get_current_win())
+    assert.matches(path .. '$', vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(code_win)))
+    assert.same({ 12, 2 }, vim.api.nvim_win_get_cursor(code_win))
+
+    pcall(vim.api.nvim_win_close, code_win, true)
+    pcall(vim.api.nvim_buf_delete, code_buf, { force = true })
   end)
 
   it('limits rendered messages and inserts a hidden-messages notice', function()

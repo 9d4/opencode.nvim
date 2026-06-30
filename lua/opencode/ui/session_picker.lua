@@ -28,15 +28,204 @@ function M._is_session_or_ancestor_deleted(session_id, delete_ids, all_sessions)
 end
 
 ---Format session parts for session picker
----@param session Session object
+---@param session Session|GlobalSession object
+---@param width? integer
 ---@return PickerItem
-function format_session_item(session, width)
-  local debug_text = 'ID: ' .. (session.id or 'N/A')
+local function format_session_item(session, width)
+  local project = (session --[[@as GlobalSession]]).project
+  local title = session.title or 'N/A'
+  if project then
+    local label = project.name or vim.fn.pathshorten(project.worktree) or project.id or '?'
+    title = title .. '  [' .. label .. ']'
+  end
   local updated_time = (session.time and session.time.updated) or 'N/A'
-  return base_picker.create_time_picker_item(session.title, updated_time, debug_text, width)
+  return base_picker.create_time_picker_item(title, updated_time, nil, width)
 end
 
-function M.pick(sessions, callback)
+--- Normalize message order to oldest-first (chronological)
+--- API may return messages in descending order; reverse if detected.
+---@param messages OpencodeMessage[]
+---@return OpencodeMessage[]
+local function normalize_message_order(messages)
+  if not messages or #messages <= 1 then
+    return messages or {}
+  end
+  -- Check if messages are in descending order by checking first two
+  local first_time = messages[1].info and messages[1].info.time and messages[1].info.time.created
+  local second_time = messages[2].info and messages[2].info.time and messages[2].info.time.created
+  if first_time and second_time and first_time > second_time then
+    local reversed = {}
+    for i = #messages, 1, -1 do
+      reversed[#reversed + 1] = messages[i]
+    end
+    return reversed
+  end
+  return messages
+end
+
+--- Append extmarks from source into target, offset by line_offset
+--- Uses append semantics (no overwrite of same-line marks)
+---@param target table<number, OutputExtmark[]> Target extmark map
+---@param extmarks table<number, OutputExtmark[]> Source extmark map
+---@param line_offset integer Line offset for source marks
+local function append_extmarks(target, extmarks, line_offset)
+  for line_idx, marks in pairs(extmarks or {}) do
+    local actual = line_idx + line_offset
+    target[actual] = target[actual] or {}
+    for _, mark in ipairs(marks) do
+      table.insert(target[actual], mark)
+    end
+  end
+end
+
+--- Filter messages for preview: keep first user message + last assistant message
+--- This is a display strategy — format_messages is the rendering mechanism.
+---@param messages OpencodeMessage[]
+---@return OpencodeMessage[], integer omitted_count
+local function filter_preview_messages(messages)
+  if #messages <= 2 then
+    return messages, 0
+  end
+  local first_user_idx = nil
+  local last_assistant_idx = nil
+  for i, msg in ipairs(messages) do
+    if msg.info and msg.info.role == 'user' and not first_user_idx then
+      first_user_idx = i
+    end
+    if msg.info and msg.info.role == 'assistant' then
+      last_assistant_idx = i
+    end
+  end
+  local result = {}
+  if first_user_idx then
+    table.insert(result, messages[first_user_idx])
+  end
+  if last_assistant_idx then
+    table.insert(result, messages[last_assistant_idx])
+  end
+  if #result == 0 then
+    return messages, 0
+  end
+  local omitted = #messages - #result
+  return result, omitted
+end
+
+--- Format messages using the existing formatter, aggregating all Outputs
+---@param messages OpencodeMessage[]
+---@param omitted_count? integer Number of messages omitted between first and second (for preview)
+---@return { lines: string[], extmarks: table<number, OutputExtmark[]>, fold_ranges: table<{from: integer, to: integer}> }
+local function format_messages(messages, omitted_count)
+  local formatter = require('opencode.ui.formatter')
+  local all_lines = {}
+  local all_extmarks = {}
+  local all_fold_ranges = {}
+  local line_offset = 0
+  local rendered_count = 0
+
+  for _, msg in ipairs(messages) do
+    if msg.info and msg.info.role then
+      -- Insert omitted notice between first and second rendered message
+      if rendered_count == 1 and omitted_count and omitted_count > 0 then
+        local notice = string.format('  ⋯ %d message(s) omitted ⋯', omitted_count)
+        vim.list_extend(all_lines, { '', notice, '' })
+        line_offset = line_offset + 3
+      end
+
+      -- Format message header (no previous_message: show full header in preview)
+      local header = formatter.format_message_header(msg)
+      vim.list_extend(all_lines, header.lines)
+      append_extmarks(all_extmarks, header.extmarks, line_offset)
+      for _, range in ipairs(header.fold_ranges or {}) do
+        table.insert(all_fold_ranges, {
+          from = range.from + line_offset,
+          to = range.to + line_offset,
+        })
+      end
+      line_offset = line_offset + #header.lines
+
+      -- Format each part
+      local parts = msg.parts or {}
+      for part_idx, part in ipairs(parts) do
+        local is_last = part_idx == #parts
+        local ok, part_output = pcall(formatter.format_part, part, msg, is_last)
+        if ok and part_output then
+          vim.list_extend(all_lines, part_output.lines)
+          append_extmarks(all_extmarks, part_output.extmarks, line_offset)
+          for _, range in ipairs(part_output.fold_ranges or {}) do
+            table.insert(all_fold_ranges, {
+              from = range.from + line_offset,
+              to = range.to + line_offset,
+            })
+          end
+          line_offset = line_offset + #part_output.lines
+        elseif not ok then
+          -- Degraded: show error line for failed part
+          table.insert(all_lines, '[render error]')
+          line_offset = line_offset + 1
+        end
+        -- Note: Output.actions intentionally not collected (preview doesn't support interactive actions)
+      end
+
+      rendered_count = rendered_count + 1
+    end
+  end
+
+  return {
+    lines = all_lines,
+    extmarks = all_extmarks,
+    fold_ranges = all_fold_ranges,
+  }
+end
+
+--- Write formatted output to a preview buffer
+---@param target PickerPreviewTarget
+---@param formatted { lines: string[], extmarks: table, fold_ranges: table }
+local function render_preview_buffer(target, formatted)
+  if not target:is_valid() then
+    return
+  end
+  local bufnr = target:get_bufnr()
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local output_window = require('opencode.ui.output_window')
+
+  target:set_lines(formatted.lines)
+  bufnr = target:get_bufnr()
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  -- Clear old extmarks then apply new ones
+  pcall(vim.api.nvim_buf_clear_namespace, bufnr, output_window.namespace, 0, -1)
+  output_window.apply_extmarks(bufnr, formatted.extmarks)
+
+  -- Configure preview window to match the main output window's gutter.
+  -- The formatter places vertical border extmarks at virt_text_win_col = -3
+  -- which requires a 3-column gutter (signcolumn=yes + foldcolumn=1) so
+  -- the border renders in the gutter instead of overlaying column 0 of text.
+  target:with_window(function()
+    vim.api.nvim_set_option_value('number', false, { win = 0 })
+    vim.api.nvim_set_option_value('relativenumber', false, { win = 0 })
+    vim.api.nvim_set_option_value('signcolumn', 'yes', { win = 0 })
+    vim.api.nvim_set_option_value('foldcolumn', '1', { win = 0 })
+    vim.api.nvim_set_option_value('statuscolumn', '', { win = 0 })
+    vim.api.nvim_set_option_value('foldmethod', 'manual', { win = 0 })
+    vim.cmd('silent! normal! zE') -- clear existing manual folds
+    local line_count = vim.api.nvim_buf_line_count(bufnr)
+    for _, range in ipairs(formatted.fold_ranges) do
+      if range.from <= line_count and range.to <= line_count then
+        vim.cmd(range.from .. ',' .. range.to .. 'fold')
+      end
+    end
+  end)
+end
+
+---@param sessions Session[]
+---@param callback fun(session: Session|nil)
+---@param opts? { scope?: 'project' | 'global' }
+function M.pick(sessions, callback, opts)
   local actions = {
     rename = {
       key = config.keymap.session_picker.rename_session,
@@ -147,16 +336,77 @@ function M.pick(sessions, callback)
       end),
       reload = true,
     },
+    fork = {
+      key = config.keymap.session_picker.fork_session,
+      label = 'fork',
+      fn = Promise.async(function(selected, opts)
+        local state = require('opencode.state')
+        local session_runtime = require('opencode.services.session_runtime')
+        local new_session = state.api_client:fork_session(selected.id):await()
+        if new_session then
+          session_runtime.switch_session(new_session.id):await()
+          table.insert(opts.items, 1, new_session)
+          return opts.items
+        end
+      end),
+      reload = true,
+    },
   }
+
+  -- Preview state for race condition protection
+  local preview_seq = 0
 
   return base_picker.pick({
     items = sessions,
     format_fn = format_session_item,
     actions = actions,
     callback = callback,
-    title = 'Select A Session',
-    width = config.ui.picker_width or 100,
+    title = (opts and opts.scope == 'global') and 'Select A Session (all projects)' or 'Select A Session',
+    width = config.ui.picker_width,
     layout_opts = config.ui.picker,
+    preview = 'custom',
+    ---@param session table
+    ---@param target PickerPreviewTarget
+    preview_fn = function(session, target)
+      preview_seq = preview_seq + 1
+      local current_seq = preview_seq
+      target:set_lines({ 'Loading...' })
+
+      local state = require('opencode.state')
+      local ok, request = pcall(function()
+        return state.api_client:list_messages(session.id, nil)
+      end)
+      if not ok or not request then
+        target:set_lines({ 'No messages or failed to load' })
+        return
+      end
+
+      request
+        :and_then(function(messages)
+          -- Check race: another selection happened while we were loading
+          if current_seq ~= preview_seq then
+            return
+          end
+          if not target:is_valid() then
+            return
+          end
+
+          if not messages or #messages == 0 then
+            target:set_lines({ 'No messages or failed to load' })
+            return
+          end
+
+          messages = normalize_message_order(messages)
+          local preview_msgs, omitted = filter_preview_messages(messages)
+          local formatted = format_messages(preview_msgs, omitted)
+          render_preview_buffer(target, formatted)
+        end)
+        :catch(function()
+          if current_seq == preview_seq and target:is_valid() then
+            target:set_lines({ 'No messages or failed to load' })
+          end
+        end)
+    end,
   })
 end
 

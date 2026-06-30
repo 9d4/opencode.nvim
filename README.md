@@ -116,13 +116,14 @@ Install the plugin with your favorite package manager. See the [Configuration](#
 ```lua
 -- Default configuration with all available options
 require('opencode').setup({
-  preferred_picker = nil, -- 'telescope', 'fzf', 'mini.pick', 'snacks', 'select', if nil, it will use the best available picker. Note mini.pick does not support multiple selections
+  preferred_picker = nil, -- 'telescope'/'telescope.nvim', 'fzf'/'fzf-lua', 'mini.pick', 'snacks'/'snacks.nvim', 'select', if nil, it will use the best available picker. Note mini.pick does not support multiple selections
   preferred_completion = nil, -- 'blink', 'nvim-cmp','vim_complete' if nil, it will use the best available completion
   default_global_keymaps = true, -- If false, disables all default global keymaps
   default_mode = 'build', -- 'build' or 'plan' or any custom configured. @see [OpenCode Agents](https://opencode.ai/docs/modes/)
   default_system_prompt = nil, -- Custom system prompt to use for all sessions. If nil, uses the default built-in system prompt
   keymap_prefix = '<leader>o', -- Default keymap prefix for global keymaps change to your preferred prefix and it will be applied to all keymaps starting with <leader>o
   opencode_executable = 'opencode', -- Name of your opencode binary
+  snapshot_path = nil, -- Override base path for the snapshot git directory (default: $XDG_DATA_HOME/opencode). Appends /snapshot/<project_id>/<worktree_hash>
 
   -- Server configuration for custom/external opencode servers
   server = {
@@ -188,6 +189,7 @@ require('opencode').setup({
       ['[['] = { 'prev_message' }, -- Navigate to previous message in the conversation
       ['<tab>'] = { 'toggle_pane', mode = { 'n', 'i' } }, -- Toggle between input and output panes
       ['i'] = { 'focus_input', 'n' }, -- Focus on input window and enter insert mode at the end of the input from the output window
+      ['gf'] = { 'jump_to_file', mode = { 'n' } }, -- Jump to file at cursor in output window
       ['<M-r>'] = { 'cycle_variant', mode = { 'n' } }, -- Cycle through available model variants
       ['<leader>oS'] = { 'select_child_session' }, -- Select and load a child session
       ['<leader>oP'] = { 'select_parent_session' }, -- Go to parent session
@@ -237,12 +239,16 @@ require('opencode').setup({
     output = {
       filetype = 'opencode_output', -- Filetype assigned to the output buffer (default: 'opencode_output')
        compact_assistant_headers = false, -- 'full' (default), 'minimal' (compact if same mode), or 'hidden' (no headers for assistant)
-      tools = {
-        show_output = true, -- Show tools output [diffs, cmd output, etc.] (default: true)
-        show_reasoning_output = true, -- Show reasoning/thinking steps output (default: true)
-        use_folds = true, -- Use folds for tool output (default: true)
-        folding_threshold = 5, -- Number of lines to show before folding when show_output is true (default: 5)
-      },
+       tools = {
+         show_output = true, -- Show tools output [diffs, cmd output, etc.] (default: true)
+         show_reasoning_output = true, -- Show reasoning/thinking steps output (default: true)
+         use_folds = true, -- Use folds for tool output (default: true)
+         folding_threshold = 25, -- Number of lines to show before folding when show_output is true (default: 25)
+         fold_exclude = { -- Tools that should never be folded (default: sequential-thinking)
+           'bash', -- built-in tool name (exact match)
+           { server = 'sequential-thinking', tool = 'sequentialthinking' }, -- MCP tool (server + tool match)
+         },
+       },
       rendering = {
         markdown_debounce_ms = 250, -- Debounce time for markdown rendering on new data (default: 250ms)
         on_data_rendered = nil, -- Called when new data is rendered; set to false to disable default RenderMarkdown/Markview behavior
@@ -341,6 +347,7 @@ require('opencode').setup({
     },
   },
   prompt_guard = nil, -- Optional function that returns boolean to control when prompts can be sent (see Prompt Guard section)
+  child_readonly = true, -- When true (default), child sessions are read-only: messaging is blocked and input window is hidden on switch
 
   -- User Hooks for custom behavior at certain events
   hooks = {
@@ -612,6 +619,7 @@ The plugin provides the following actions that can be triggered via keymaps, com
 | **Go to parent session**                                    | `<leader>oP`                          | `:Opencode session parent`                  | `require('opencode.api').select_parent_session()`                      |
 | Open timeline picker (navigate/undo/redo/fork to message)   | `<leader>oT`                          | `:Opencode timeline`                        | `require('opencode.api').timeline()`                                   |
 | Browse code references from conversation                    | `gr` (window)                         | `:Opencode references` / `/references`      | `require('opencode.api').references()`                                 |
+| Jump to file referenced at cursor in output window          | `gf` (window)                          | `:Opencode jump_to_file` / `/jump_to_file`  | `require('opencode.api').jump_to_file()`                              |
 | Configure provider and model                                | `<leader>op`                          | `:Opencode configure provider`              | `require('opencode.api').configure_provider()`                         |
 | Configure model variant                                     | `<leader>oV`                          | `:Opencode variant` / `/variant`            | `require('opencode.api').configure_variant()`                          |
 | Cycle through model variants                                | `<M-r>` (window)                      | -                                           | `require('opencode.api').cycle_variant()`                              |
@@ -634,6 +642,7 @@ The plugin provides the following actions that can be triggered via keymaps, com
 | Set mode to Build                                           | -                                     | `:Opencode agent build`                     | `require('opencode.api').agent_build()`                                |
 | Set mode to Plan                                            | -                                     | `:Opencode agent plan`                      | `require('opencode.api').agent_plan()`                                 |
 | Select and switch mode/agent                                | -                                     | `:Opencode agent select`                    | `require('opencode.api').select_agent()`                               |
+| Browse and select available skills                          | -                                     | `:Opencode skills` / `/skills`              | -                                                                      |
 | Display list of available mcp servers                       | -                                     | `:Opencode mcp`                             | `require('opencode.api').mcp()`                                        |
 | Run user commands                                           | -                                     | `:Opencode run user_command`                | `require('opencode.api').run_user_command()`                           |
 | Share current session and get a link                        | -                                     | `:Opencode session share` / `/share`        | `require('opencode.api').share()`                                      |
@@ -971,6 +980,22 @@ When `port = 'auto'` is used, opencode.nvim:
 - Only kills the server when the last nvim instance exits (if `auto_kill = true`). Only applies to servers spawned by the plugin with `spawn_command`/`kill_command`.
 - Locally spawned servers will be killed automatically regardless of the auto_kill setting if they are the last nvim instance using them
 
+## 🎯 Skills
+
+Skills are reusable, installable instruction packs that enhance opencode.nvim with domain-specific workflows. Each skill provides its own behavior, prompts, and tool configurations.
+
+### Browsing Skills
+
+- **Via command:** Run `:Opencode skills` to open the skills picker
+- **Via slash command:** Type `/skills` in the input window to open the skills picker
+- **Via completion:** Type `/` in the input window and select a skill from the completion menu
+
+The skills picker displays each skill with its name, description, and full content rendered as markdown in the preview pane. Selecting a skill executes it directly — opening a session and sending the skill's content as a prompt.
+
+### Installing Skills
+
+See the [Opencode Skills Documentation](https://opencode.ai/docs/skills/) for how to discover and install community skills.
+
 ## User Commands and Slash Commands
 
 You can run predefined user commands and built-in slash commands from the input window by typing `/`. This opens a command picker where you can select a command to execute. The output of the command will be included in your prompt context.
@@ -985,6 +1010,7 @@ You can run predefined user commands and built-in slash commands from the input 
 - `/agents_init` — Initialize/update AGENTS.md
 - `/help` — Show help
 - `/mcp` — Show MCP servers
+- `/skills` — Browse and select available skills
 - `/models` — Switch provider/model
 - `/variant` — Switch model variant
 - `/sessions` — Switch session

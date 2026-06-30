@@ -17,9 +17,16 @@ local Promise = require('opencode.promise')
 ---@field title string|fun(): string The picker title
 ---@field width? number Optional width for the picker (defaults to config or current window width)
 ---@field multi_selection? table<string, boolean> Actions that support multi-selection
----@field preview? "file"|"none"|false Preview mode: "file" for file preview, "none" or false to disable
+---@field preview? "file"|"custom"|"none"|false Preview mode: "file" for file preview, "custom" for custom preview via preview_fn, "none" or false to disable
+---@field preview_fn? fun(item: any, target: PickerPreviewTarget): nil Custom preview function, called when preview = 'custom' and a selection changes
 ---@field layout_opts? OpencodeUIPickerConfig
 ---@field close? fun() Close the picker programmatically (set by the backend)
+
+---@class PickerPreviewTarget
+---@field get_bufnr fun(self: PickerPreviewTarget): integer?
+---@field is_valid fun(self: PickerPreviewTarget): boolean
+---@field set_lines fun(self: PickerPreviewTarget, lines: string[]): nil
+---@field with_window fun(self: PickerPreviewTarget, fn: fun(): nil): nil
 
 ---@class TelescopeEntry
 ---@field value any
@@ -56,6 +63,64 @@ local Promise = require('opencode.promise')
 ---@class BasePicker
 local M = {}
 local picker = require('opencode.ui.picker')
+
+---@param bufnr integer?
+---@return PickerPreviewTarget
+local function create_buffer_preview_target(bufnr)
+  return {
+    get_bufnr = function()
+      return bufnr
+    end,
+    is_valid = function()
+      return bufnr ~= nil and vim.api.nvim_buf_is_valid(bufnr)
+    end,
+    set_lines = function(_, lines)
+      if bufnr == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+        return
+      end
+      local modifiable = vim.bo[bufnr].modifiable
+      vim.bo[bufnr].modifiable = true
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+      vim.bo[bufnr].modifiable = modifiable
+    end,
+    with_window = function(_, fn)
+      if bufnr == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+        return
+      end
+      local win = vim.fn.bufwinid(bufnr)
+      if win ~= -1 then
+        vim.api.nvim_win_call(win, fn)
+      end
+    end,
+  }
+end
+
+---@param ctx snacks.picker.preview.ctx
+---@return PickerPreviewTarget
+local function create_snacks_preview_target(ctx)
+  return {
+    get_bufnr = function()
+      return ctx.buf
+    end,
+    is_valid = function()
+      return ctx.buf ~= nil and vim.api.nvim_buf_is_valid(ctx.buf)
+    end,
+    set_lines = function(_, lines)
+      if ctx.preview and ctx.preview.set_lines then
+        ctx.preview:set_lines(lines)
+      elseif ctx.buf and vim.api.nvim_buf_is_valid(ctx.buf) then
+        create_buffer_preview_target(ctx.buf):set_lines(lines)
+      end
+    end,
+    with_window = function(_, fn)
+      if ctx.win and vim.api.nvim_win_is_valid(ctx.win) then
+        vim.api.nvim_win_call(ctx.win, fn)
+        return
+      end
+      create_buffer_preview_target(ctx.buf):with_window(fn)
+    end,
+  }
+end
 
 ---Build title with action legend
 ---@param base_title string The base title
@@ -146,7 +211,22 @@ local function telescope_ui(opts)
     prompt_title = opts.title,
     finder = finders.new_table({ results = opts.items, entry_maker = make_entry }),
     sorter = conf.generic_sorter({}),
-    previewer = opts.preview == 'file' and require('telescope.previewers').vim_buffer_vimgrep.new({}) or nil,
+    previewer = (function()
+      if opts.preview == 'file' then
+        return require('telescope.previewers').vim_buffer_vimgrep.new({})
+      elseif opts.preview == 'custom' and opts.preview_fn then
+        return require('telescope.previewers').new_buffer_previewer({
+          define_preview = function(self, entry)
+            if not entry then
+              return
+            end
+            opts.preview_fn(entry.value, create_buffer_preview_target(self.state.bufnr))
+          end,
+        })
+      else
+        return nil
+      end
+    end)(),
     layout_config = opts.width and {
         width = opts.width + 7, -- extra space for telescope UI
       } or nil,
@@ -235,6 +315,54 @@ end
 local function fzf_ui(opts)
   local fzf_lua = require('fzf-lua')
 
+  local function finder(fzf_cb, width)
+    for idx, item in ipairs(opts.items) do
+      local line_str = opts.format_fn(item, width):to_string()
+
+      -- Prepend index with SOH delimiter for reliable matching
+      local indexed_line = tostring(idx) .. '\x01' .. line_str
+
+      -- For file preview support, append file:line:col format
+      -- fzf-lua's builtin previewer automatically parses this format
+      if opts.preview == 'file' and type(item) == 'table' then
+        local file_path = item.file_path or item.path or item.filename or item.file
+        local line = item.line or item.lnum
+        local col = item.column or item.col
+
+        if file_path then
+          -- fzf-lua parses "path:line:col:" format for preview positioning
+          local pos_info = file_path
+          if line then
+            pos_info = pos_info .. ':' .. tostring(line)
+            if col then
+              pos_info = pos_info .. ':' .. tostring(col)
+            end
+            pos_info = pos_info .. ':'
+          end
+          -- Append position info after nbsp separator (fzf-lua standard)
+          -- nbsp is U+2002 EN SPACE, not regular tab
+          local nbsp = '\xe2\x80\x82'
+          indexed_line = indexed_line .. nbsp .. pos_info
+        end
+      end
+
+      fzf_cb(indexed_line)
+    end
+    fzf_cb()
+  end
+
+  local has_custom_preview = opts.preview == 'custom' and opts.preview_fn ~= nil
+  local format_width
+
+  -- defer item processing until preview if using custom preview_fn
+  -- so we can pass the width of the fzf window to the format_fn for optimal formatting
+  local width_callback = has_custom_preview
+      and function(_, _, _, ctx)
+        format_width = (ctx.env.FZF_COLUMNS or vim.o.columns) - (ctx.env.FZF_PREVIEW_COLUMNS or 0)
+        format_width = math.min(format_width, vim.o.columns - 8)
+      end
+    or nil
+
   ---@return table
   local function create_fzf_config()
     local has_multi_action = util.some(opts.actions, function(action)
@@ -242,6 +370,9 @@ local function fzf_ui(opts)
     end)
 
     return {
+      fzf_cli_args = width_callback and ('--bind=' .. require('fzf-lua.libuv').shellescape(
+        'start:+transform:' .. require('fzf-lua.shell').stringify_data(width_callback, opts)
+      )) or nil,
       winopts = opts.width and {
           width = opts.width + 8, -- extra space for fzf UI
         } or nil,
@@ -250,10 +381,38 @@ local function fzf_ui(opts)
         ['--multi'] = has_multi_action and true or nil,
         ['--with-nth'] = '2..', -- hide the index prefix from display
         ['--delimiter'] = '\x01', -- use SOH as delimiter (invisible char)
+        ['--read0'] = true,
       },
       _headers = { 'actions' },
-      -- Enable builtin previewer for file preview support
-      previewer = opts.preview == 'file' and 'builtin' or nil,
+      previewer = (function()
+        if opts.preview == 'file' then
+          return 'builtin'
+        elseif has_custom_preview then
+          return {
+            _ctor = function()
+              local previewer = require('fzf-lua.previewer.builtin').buffer_or_file:extend()
+              function previewer:populate_preview_buf(entry_str)
+                if not self.win or not self.win:validate_preview() then
+                  return
+                end
+                local idx_str = entry_str:match('^(%d+)\x01')
+                local idx = tonumber(idx_str)
+                if not idx or not opts.items[idx] then
+                  return
+                end
+                -- Create scratch buffer, attach to preview window first
+                -- so preview_fn can use bufwinid for window-local ops (folds)
+                local buf = self:get_tmp_buffer()
+                self:set_preview_buf(buf, true) -- min_winopts=true
+                opts.preview_fn(opts.items[idx], create_buffer_preview_target(buf))
+              end
+              return previewer
+            end,
+          }
+        else
+          return nil
+        end
+      end)(),
       fn_fzf_index = function(line)
         -- Extract the numeric index prefix before the SOH delimiter
         local idx_str = line:match('^(%d+)\x01')
@@ -263,45 +422,6 @@ local function fzf_ui(opts)
         return nil
       end,
     }
-  end
-
-  ---@return fun(fzf_cb: fun(line?: string))
-  local function create_finder()
-    return function(fzf_cb)
-      for idx, item in ipairs(opts.items) do
-        local line_str = opts.format_fn(item):to_string()
-
-        -- Prepend index with SOH delimiter for reliable matching
-        local indexed_line = tostring(idx) .. '\x01' .. line_str
-
-        -- For file preview support, append file:line:col format
-        -- fzf-lua's builtin previewer automatically parses this format
-        if opts.preview == 'file' and type(item) == 'table' then
-          local file_path = item.file_path or item.path or item.filename or item.file
-          local line = item.line or item.lnum
-          local col = item.column or item.col
-
-          if file_path then
-            -- fzf-lua parses "path:line:col:" format for preview positioning
-            local pos_info = file_path
-            if line then
-              pos_info = pos_info .. ':' .. tostring(line)
-              if col then
-                pos_info = pos_info .. ':' .. tostring(col)
-              end
-              pos_info = pos_info .. ':'
-            end
-            -- Append position info after nbsp separator (fzf-lua standard)
-            -- nbsp is U+2002 EN SPACE, not regular tab
-            local nbsp = '\xe2\x80\x82'
-            indexed_line = indexed_line .. nbsp .. pos_info
-          end
-        end
-
-        fzf_cb(indexed_line)
-      end
-      fzf_cb()
-    end
   end
 
   ---Reopen fzf-lua to reflect updated picker items.
@@ -408,7 +528,14 @@ local function fzf_ui(opts)
   local fzf_config = create_fzf_config()
   fzf_config.actions = actions_config
 
-  fzf_lua.fzf_exec(create_finder(), fzf_config)
+  fzf_lua.fzf_exec(function(fzf_cb)
+    if width_callback then
+      vim.wait(1000, function()
+        return format_width
+      end)
+    end
+    finder(fzf_cb, format_width)
+  end, fzf_config)
 end
 
 ---Mini.pick UI implementation
@@ -490,7 +617,8 @@ end
 local function snacks_picker_ui(opts)
   local Snacks = require('snacks')
 
-  local has_preview = opts.preview == 'file'
+  local has_custom_preview = opts.preview == 'custom' and opts.preview_fn ~= nil
+  local has_preview = opts.preview == 'file' or has_custom_preview
 
   local title = type(opts.title) == 'function' and opts.title() or opts.title
   ---@cast title string
@@ -498,22 +626,27 @@ local function snacks_picker_ui(opts)
   local layout_opts = opts.layout_opts and opts.layout_opts.snacks_layout or nil
 
   local selection_made = false
+  local default_layout = {
+    preset = has_custom_preview and 'default' or 'select',
+    config = function(layout)
+      local width = opts.width and (opts.width + 3) or nil -- extra space for snacks UI
+      if not has_preview then
+        layout.layout.width = width
+        layout.layout.max_width = width
+        layout.layout.min_width = width
+      end
+    end,
+  }
+  if opts.preview == 'file' then
+    default_layout.preview = 'main'
+  elseif not has_preview then
+    default_layout.preview = false
+  end
 
   ---@type snacks.picker.Config
   local snack_opts = {
     title = title,
-    layout = layout_opts or {
-      preview = has_preview and 'main' or false,
-      preset = 'select',
-      config = function(layout)
-        local width = opts.width and (opts.width + 3) or nil -- extra space for snacks UI
-        if not has_preview then
-          layout.layout.width = width
-          layout.layout.max_width = width
-          layout.layout.min_width = width
-        end
-      end,
-    },
+    layout = layout_opts or default_layout,
     finder = function()
       return opts.items
     end,
@@ -560,9 +693,15 @@ local function snacks_picker_ui(opts)
     },
   }
 
-  -- Add file preview if enabled
-  if has_preview then
+  if opts.preview == 'file' then
     snack_opts.preview = 'file'
+  elseif has_custom_preview then
+    snack_opts.preview = function(ctx)
+      if ctx.item then
+        ctx.preview:reset()
+        opts.preview_fn(ctx.item, create_snacks_preview_target(ctx))
+      end
+    end
   else
     snack_opts.preview = function()
       return false
@@ -725,9 +864,52 @@ function M.pick(opts)
     opts.width = config.ui.picker_width
   end
 
+  -- picker_width = false means "use picker backend defaults, no override"
+  if opts.width == false then
+    opts.width = nil
+  end
+
+  -- Resolve relative width (0 < w <= 1) to absolute columns so that
+  -- format functions and all picker backends receive a consistent value.
+  if opts.width and opts.width > 0 and opts.width <= 1 then
+    opts.width = math.floor(vim.o.columns * opts.width)
+  end
+
+  -- When width is nil (picker_width = false or unset), derive a content width
+  -- from the picker backend's default window size so format functions can
+  -- produce correctly-sized output that fills the backend's content area.
+  local format_width = opts.width
+  if not format_width then
+    if picker_type == 'fzf' then
+      -- Read fzf-lua's effective winopts.width (respects user customization).
+      local fzf_win_width = 0.8
+      local ok, fzf_config = pcall(require, 'fzf-lua.config')
+      if ok and fzf_config and fzf_config.globals and fzf_config.globals.winopts then
+        fzf_win_width = fzf_config.globals.winopts.width or fzf_win_width
+      end
+      -- Resolve fraction to absolute columns
+      if fzf_win_width > 0 and fzf_win_width <= 1 then
+        fzf_win_width = math.floor(vim.o.columns * fzf_win_width)
+      end
+      -- Subtract the same chrome offset used when we set winopts ourselves (+8),
+      -- which covers borders, padding, and fzf's pointer indicator.
+      format_width = fzf_win_width - 8
+    else
+      format_width = math.floor(vim.o.columns * 0.8)
+    end
+  end
+
+  local has_preview = opts.preview and opts.preview ~= 'none' and opts.preview ~= false
+  if picker_type == 'fzf' and has_preview and format_width then
+    local window_cols = format_width + 8
+    -- Match fzf-lua's default right:60% preview split so item formatting
+    -- targets the visible list pane instead of the full window width.
+    format_width = math.floor(window_cols * 0.4) - 4
+  end
+
   local original_format_fn = opts.format_fn
-  opts.format_fn = function(item)
-    return original_format_fn(item, opts.width)
+  opts.format_fn = function(item, width)
+    return original_format_fn(item, width or format_width)
   end
 
   local title_str = type(opts.title) == 'function' and opts.title() or opts.title --[[@as string]]

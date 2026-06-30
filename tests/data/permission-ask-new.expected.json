@@ -22,6 +22,9 @@
             "OpencodeMessageRoleUser"
           ],
           [
+            " "
+          ],
+          [
             "",
             "OpencodeHint"
           ],
@@ -216,7 +219,10 @@
             "OpencodeMessageRoleAssistant"
           ],
           [
-            " gpt-4.1",
+            " "
+          ],
+          [
+            "github-copilot/gpt-4.1",
             "OpencodeHint"
           ],
           [
@@ -388,6 +394,9 @@
           [
             "SYSTEM",
             "OpencodeMessageRoleSystem"
+          ],
+          [
+            " "
           ],
           [
             "",
@@ -766,5 +775,13 @@
     "",
     ""
   ],
-  "timestamp": 1779709441
+  "window": {
+    "cursor": [
+      37,
+      0
+    ],
+    "effective_bottom": 37,
+    "line_count": 38,
+    "visible_bottom": 38
+  }
 }

@@ -5,12 +5,30 @@ local permission_window = require('opencode.ui.permission_window')
 local Promise = require('opencode.promise')
 local ctx = require('opencode.ui.renderer.ctx')
 local events = require('opencode.ui.renderer.events')
+local event_scope = require('opencode.ui.event_scope')
 local flush = require('opencode.ui.renderer.flush')
 local scroll = require('opencode.ui.renderer.scroll')
 
 local M = {}
 local HIDDEN_MESSAGES_NOTICE_MESSAGE_ID = '__opencode_hidden_messages_notice__'
 local HIDDEN_MESSAGES_NOTICE_PART_ID = '__opencode_hidden_messages_notice_part__'
+
+local LAZYRENDER_EST_LINES_PER_MSG = 5
+local LAZYRENDER_VIEWPORT_BUFFER = 1.5
+
+---Calculate how many messages to render initially based on window height.
+---@return integer
+local function get_initial_render_count()
+  local win = state.windows and state.windows.output_win
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return math.huge -- no window: render all (tests, headless)
+  end
+  local ok, height = pcall(vim.api.nvim_win_get_height, win)
+  if not ok or not height or height <= 0 then
+    return math.huge
+  end
+  return math.ceil(height / LAZYRENDER_EST_LINES_PER_MSG * LAZYRENDER_VIEWPORT_BUFFER)
+end
 
 ---@return integer|nil
 local function get_max_rendered_messages()
@@ -242,6 +260,27 @@ end
 -- can be stubbed cleanly (e.g. stub(renderer, '_render_full_session_data'))
 M.on_session_updated = events.on_session_updated
 
+function M.event_subscriptions()
+  return {
+    { 'session.updated', events.on_session_updated },
+    { 'session.compacted', events.on_session_compacted },
+    { 'session.error', events.on_session_error },
+    { 'message.updated', events.on_message_updated },
+    { 'message.removed', events.on_message_removed },
+    { 'message.part.updated', events.on_part_updated },
+    { 'message.part.removed', events.on_part_removed },
+    { 'permission.updated', events.on_permission_updated },
+    { 'permission.asked', events.on_permission_updated },
+    { 'permission.replied', events.on_permission_replied },
+    { 'question.asked', events.on_question_asked },
+    { 'question.replied', events.on_question_replied },
+    { 'question.rejected', events.on_question_replied },
+    { 'file.edited', events.on_file_edited },
+    { 'custom.restore_point.created', events.on_restore_points },
+    { 'custom.emit_events.finished', M.on_emit_events_finished },
+  }
+end
+
 ---Reset all renderer state and clear the output buffer
 function M.reset()
   ctx:reset()
@@ -274,30 +313,12 @@ function M.setup_subscriptions(subscribe)
     return
   end
 
-  local subs = {
-    { 'session.updated', events.on_session_updated },
-    { 'session.compacted', events.on_session_compacted },
-    { 'session.error', events.on_session_error },
-    { 'message.updated', events.on_message_updated },
-    { 'message.removed', events.on_message_removed },
-    { 'message.part.updated', events.on_part_updated },
-    { 'message.part.removed', events.on_part_removed },
-    { 'permission.updated', events.on_permission_updated },
-    { 'permission.asked', events.on_permission_updated },
-    { 'permission.replied', events.on_permission_replied },
-    { 'question.asked', events.on_question_asked },
-    { 'question.replied', events.clear_question_display },
-    { 'question.rejected', events.clear_question_display },
-    { 'file.edited', events.on_file_edited },
-    { 'custom.restore_point.created', events.on_restore_points },
-    { 'custom.emit_events.finished', M.on_emit_events_finished },
-  }
-
-  for _, sub in ipairs(subs) do
+  for _, sub in ipairs(M.event_subscriptions()) do
+    local callback = event_scope.scoped_callback(sub[1], sub[2])
     if subscribe then
-      state.event_manager:subscribe(sub[1], sub[2])
+      state.event_manager:subscribe(sub[1], callback)
     else
-      state.event_manager:unsubscribe(sub[1], sub[2])
+      state.event_manager:unsubscribe(sub[1], callback)
     end
   end
 end
@@ -319,6 +340,9 @@ end
 ---@param opts? { restore_model_from_messages?: boolean }
 function M._render_full_session_data(session_data, opts)
   opts = opts or {}
+  -- Read before reset() clears it
+  local lazy_limit = ctx.lazy_render_count
+  local t_start = vim.uv.hrtime()
   M.reset()
   state.renderer.set_messages(session_data or {})
 
@@ -329,6 +353,18 @@ function M._render_full_session_data(session_data, opts)
   local visible_messages, hidden_count = get_visible_session_messages(state.messages)
   local revert_index = get_revert_index(state.messages)
 
+  if lazy_limit == nil then
+    local initial = get_initial_render_count()
+    if #visible_messages > initial then
+      lazy_limit = initial
+    end
+  end
+  ctx.lazy_render_count = lazy_limit
+  if lazy_limit and #visible_messages > lazy_limit then
+    visible_messages = vim.list_slice(visible_messages, #visible_messages - lazy_limit + 1)
+  end
+
+  local t_format_start = vim.uv.hrtime()
   flush.begin_bulk_mode()
 
   if hidden_count > 0 then
@@ -376,8 +412,10 @@ function M._render_full_session_data(session_data, opts)
     events.on_part_updated({ part = revert_message.parts[1] })
   end
 
+  local t_format_end = vim.uv.hrtime()
   flush.flush()
   flush.end_bulk_mode()
+  local t_flush_end = vim.uv.hrtime()
 
   if opts.restore_model_from_messages then
     require('opencode.services.agent_model').initialize_current_model({ restore_from_messages = true })
@@ -405,6 +443,53 @@ function M.render_from_cache(session_data)
     require('opencode.ui.question_window').restore_pending_question(active_session.id)
     permission_window.restore_pending_permissions(active_session.id)
   end
+end
+
+---Load more older messages into the output buffer.
+---Called when user scrolls to the top of the output window.
+---@return boolean Whether more messages were loaded
+function M.load_more_messages()
+  if not state.messages then
+    return false
+  end
+  -- nil means no lazy limit → all messages already rendered
+  if not ctx.lazy_render_count then
+    return false
+  end
+  local total = #get_visible_session_messages(state.messages)
+  if total == 0 then
+    return false
+  end
+  if ctx.lazy_render_count >= total then
+    return false
+  end
+
+  -- Load another viewport's worth
+  ctx.lazy_render_count = math.min(ctx.lazy_render_count + get_initial_render_count(), total)
+  M.render_from_cache(state.messages)
+  return true
+end
+
+---Load all remaining messages and re-render.
+---Used when user explicitly navigates to the top (gg) to ensure
+---the full history is available for navigation and search.
+---@return boolean Whether any messages were loaded
+function M.load_all_messages()
+  if not state.messages then
+    return false
+  end
+  local total = #get_visible_session_messages(state.messages)
+  if total == 0 then
+    return false
+  end
+  -- nil means no lazy limit → all messages already rendered
+  if not ctx.lazy_render_count or ctx.lazy_render_count >= total then
+    return false
+  end
+
+  ctx.lazy_render_count = total
+  M.render_from_cache(state.messages)
+  return true
 end
 
 ---Fetch the active session from the server and render it
@@ -534,6 +619,37 @@ function M.get_prev_rendered_message(current_line)
     local rendered = message and message.info and message.info.id and ctx.render_state:get_message(message.info.id)
     if rendered and rendered.line_start and rendered.line_start + 1 < current_line then
       return rendered
+    end
+  end
+
+  return nil
+end
+
+---@param current_line integer
+---@return RenderedMessage|nil
+function M.get_next_user_message(current_line)
+  for _, message in ipairs(state.messages or {}) do
+    if message.info and message.info.role == 'user' then
+      local rendered = message.info.id and ctx.render_state:get_message(message.info.id) or nil
+      if rendered and rendered.line_start and rendered.line_start + 1 > current_line then
+        return rendered
+      end
+    end
+  end
+
+  return nil
+end
+
+---@param current_line integer
+---@return RenderedMessage|nil
+function M.get_prev_user_message(current_line)
+  for i = #(state.messages or {}), 1, -1 do
+    local message = state.messages[i]
+    if message and message.info and message.info.role == 'user' then
+      local rendered = message.info.id and ctx.render_state:get_message(message.info.id)
+      if rendered and rendered.line_start and rendered.line_start + 1 < current_line then
+        return rendered
+      end
     end
   end
 

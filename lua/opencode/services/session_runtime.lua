@@ -13,9 +13,56 @@ local agent_model = require('opencode.services.agent_model')
 
 local M = {}
 
+---@return boolean
+function M.is_session_locked()
+  local explicit = state.store.get('session_locked')
+  if explicit ~= nil then
+    return explicit
+  end
+  return config.lock_session_to_directory == true
+end
+
+---@param value boolean
+---@return boolean
+function M.set_session_lock(value)
+  state.session.set_locked(value and true or false)
+  return M.is_session_locked()
+end
+
+---@return boolean new_value
+function M.toggle_session_lock()
+  return M.set_session_lock(not M.is_session_locked())
+end
+
+local function focus_after_session_switch(selected_session)
+  if not state.ui.is_visible() then
+    M.open()
+    return
+  end
+
+  if selected_session and selected_session.parentID and config.child_readonly then
+    if not input_window.is_hidden() then
+      input_window._hide()
+    end
+    ui.focus_output()
+    return
+  end
+
+  if input_window.is_hidden() then
+    input_window._show()
+  end
+  ui.focus_input()
+end
+
 ---@param parent_id string?
-M.select_session = Promise.async(function(parent_id)
-  local all_sessions = session.get_all_workspace_sessions():await() or {}
+---@param scope? 'project' | 'global' when nil, defaults to project-scoped
+M.select_session = Promise.async(function(parent_id, scope)
+  local all_sessions
+  if scope == 'global' then
+    all_sessions = session.get_all_global_sessions():await() or {}
+  else
+    all_sessions = session.get_all_workspace_sessions():await() or {}
+  end
   ---@cast all_sessions Session[]
 
   local filtered_sessions = vim.tbl_filter(function(s)
@@ -38,7 +85,7 @@ M.select_session = Promise.async(function(parent_id)
       return
     end
     M.switch_session(selected_session.id)
-  end)
+  end, { scope = scope })
 end)
 
 M.switch_session = Promise.async(function(session_id)
@@ -46,23 +93,8 @@ M.switch_session = Promise.async(function(session_id)
 
   state.model.clear()
   agent_model.ensure_current_mode():await()
-
   state.session.set_active(selected_session)
-  if state.ui.is_visible() then
-    if selected_session and selected_session.parentID then
-      if not input_window.is_hidden() then
-        input_window._hide()
-      end
-      ui.focus_output()
-    else
-      if input_window.is_hidden() then
-        input_window._show()
-      end
-      ui.focus_input()
-    end
-  else
-    M.open()
-  end
+  focus_after_session_switch(selected_session)
 end)
 
 ---@param opts? OpenOpts
@@ -88,6 +120,9 @@ M.check_cwd = function()
       { current_cwd = state.current_cwd, new_cwd = vim.fn.getcwd() }
     )
     state.context.set_current_cwd(vim.fn.getcwd())
+    if M.is_session_locked() then
+      return
+    end
     state.session.clear_active()
     context.unload_attachments()
   end
@@ -206,8 +241,10 @@ end
 
 ---@param opts? SendMessageOpts
 M.cancel = Promise.async(function()
-  if state.active_session and state.jobs.is_running() then
-    vim.g.opencode_abort_count = (vim.g.opencode_abort_count or 0) + 1
+  if state.active_session then
+    if state.jobs.is_running() then
+      vim.g.opencode_abort_count = (vim.g.opencode_abort_count or 0) + 1
+    end
 
     local permissions = state.pending_permissions or {}
     if #permissions > 0 and state.api_client then
@@ -307,7 +344,16 @@ end)
 
 M.handle_directory_change = Promise.async(function()
   local cwd = vim.fn.getcwd()
-  log.debug('Working directory change %s', vim.inspect({ cwd = cwd }))
+  log.debug('Working directory change %s', vim.inspect({ cwd = cwd, locked = M.is_session_locked() }))
+
+  if M.is_session_locked() and state.active_session then
+    vim.notify(
+      'Session locked, staying on [' .. state.active_session.id .. '] in new working dir [' .. cwd .. ']',
+      vim.log.levels.INFO
+    )
+    return
+  end
+
   vim.notify('Loading last session for new working dir [' .. cwd .. ']', vim.log.levels.INFO)
 
   state.session.clear_active()

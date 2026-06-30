@@ -4,26 +4,45 @@ local output_window = require('opencode.ui.output_window')
 local flush = require('opencode.ui.renderer.flush')
 local stub = require('luassert.stub')
 
-describe('output_window.create_buf', function()
+---@param value string
+---@return table<string, string>
+local function parse_fillchars(value)
+  local result = {}
+  for _, part in ipairs(vim.split(value, ',', { plain = true, trimempty = true })) do
+    local key, item = part:match('^([^:]+):(.*)$')
+    if key and item then
+      result[key] = item
+    end
+  end
+  return result
+end
+
+describe('ui.create_windows output filetype', function()
+  local ui = require('opencode.ui.ui')
   local original_config
+  local windows
 
   before_each(function()
     original_config = vim.deepcopy(config.values)
     config.values = vim.deepcopy(config.defaults)
+    state.ui.set_windows(nil)
   end)
 
   after_each(function()
+    if windows then
+      pcall(ui.close_windows, windows, false)
+      windows = nil
+    end
+    state.ui.set_windows(nil)
     config.values = original_config
   end)
 
   it('uses default output filetype', function()
     config.setup({})
-    local buf = output_window.create_buf()
+    windows = ui.create_windows()
 
-    local filetype = vim.api.nvim_get_option_value('filetype', { buf = buf })
+    local filetype = vim.api.nvim_get_option_value('filetype', { buf = windows.output_buf })
     assert.equals('opencode_output', filetype)
-
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
   end)
 
   it('uses configured output filetype', function()
@@ -35,12 +54,10 @@ describe('output_window.create_buf', function()
       },
     })
 
-    local buf = output_window.create_buf()
-    local filetype = vim.api.nvim_get_option_value('filetype', { buf = buf })
+    windows = ui.create_windows()
+    local filetype = vim.api.nvim_get_option_value('filetype', { buf = windows.output_buf })
 
     assert.equals('markdown', filetype)
-
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
   end)
 end)
 
@@ -144,12 +161,31 @@ describe('output_window.setup', function()
     assert.is_false(cursorline)
   end)
 
-  it('defaults folds to closed for expr-based output folds', function()
+  it('uses manual folds for output fold ranges', function()
     output_window.setup({ output_buf = buf, output_win = win })
 
+    local foldmethod = vim.api.nvim_get_option_value('foldmethod', { win = win })
     local foldlevel = vim.api.nvim_get_option_value('foldlevel', { win = win })
 
+    assert.equals('manual', foldmethod)
     assert.equals(0, foldlevel)
+  end)
+
+  it('preserves existing fillchars while setting fold fillchars', function()
+    vim.api.nvim_set_option_value('fillchars', 'eob:~,lastline:@', { win = win, scope = 'local' })
+
+    output_window.setup({ output_buf = buf, output_win = win })
+
+    local fillchars = vim.api.nvim_get_option_value('fillchars', { win = win })
+
+    assert.same({
+      eob = '~',
+      lastline = '@',
+      fold = '-',
+      foldopen = '-',
+      foldclose = '+',
+      foldsep = '│',
+    }, parse_fillchars(fillchars))
   end)
 
   it('applies closed folds immediately when fold ranges change', function()
@@ -165,6 +201,32 @@ describe('output_window.setup', function()
     assert.equals(1, foldclosed)
   end)
 
+  it('does not restore the view when following the bottom during fold updates', function()
+    output_window.setup({ output_buf = buf, output_win = win })
+    output_window.set_lines({ 'a', 'b', 'c', 'd' })
+    vim.api.nvim_win_set_cursor(win, { 4, 0 })
+
+    local winrestview_stub = stub(vim.fn, 'winrestview')
+
+    output_window.set_folds({ { from = 1, to = 3 } })
+
+    assert.stub(winrestview_stub).was_not_called()
+    winrestview_stub:revert()
+  end)
+
+  it('restores the view when the user is reading away from the bottom', function()
+    output_window.setup({ output_buf = buf, output_win = win })
+    output_window.set_lines({ 'a', 'b', 'c', 'd' })
+    vim.api.nvim_win_set_cursor(win, { 2, 0 })
+
+    local winrestview_stub = stub(vim.fn, 'winrestview')
+
+    output_window.set_folds({ { from = 1, to = 3 } })
+
+    assert.stub(winrestview_stub).was_called()
+    winrestview_stub:revert()
+  end)
+
   it('stores fold metadata in a lookup-friendly structure', function()
     output_window.setup({ output_buf = buf, output_win = win })
     output_window.set_folds({ { from = 3, to = 5 }, { from = 1, to = 2 } })
@@ -176,7 +238,6 @@ describe('output_window.setup', function()
         { from = 1, to = 2 },
         { from = 3, to = 5 },
       },
-      starts = { 1, 3 },
     }, folds)
   end)
 
@@ -189,25 +250,7 @@ describe('output_window.setup', function()
     local folds = vim.api.nvim_buf_get_var(buf, 'opencode_folds')
     assert.same({
       ranges = { { from = 1, to = 3 } },
-      starts = { 1 },
     }, folds)
-  end)
-
-  it('evaluates fold_expr against the fold lookup structure', function()
-    output_window.setup({ output_buf = buf, output_win = win })
-    output_window.set_folds({ { from = 2, to = 4 } })
-
-    local inside = vim.api.nvim_win_call(win, function()
-      vim.v.lnum = 3
-      return output_window.fold_expr()
-    end)
-    local outside = vim.api.nvim_win_call(win, function()
-      vim.v.lnum = 5
-      return output_window.fold_expr()
-    end)
-
-    assert.equals(1, inside)
-    assert.equals(0, outside)
   end)
 end)
 

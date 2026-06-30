@@ -22,6 +22,9 @@
             "OpencodeMessageRoleUser"
           ],
           [
+            " "
+          ],
+          [
             "",
             "OpencodeHint"
           ],
@@ -276,7 +279,10 @@
             "OpencodeMessageRoleAssistant"
           ],
           [
-            " gpt-5-mini",
+            " "
+          ],
+          [
+            "github-copilot/gpt-5-mini",
             "OpencodeHint"
           ],
           [
@@ -338,5 +344,14 @@
     "",
     ""
   ],
-  "timestamp": 1770935235
+  "timestamp": 1770935235,
+  "window": {
+    "cursor": [
+      25,
+      0
+    ],
+    "effective_bottom": 25,
+    "line_count": 26,
+    "visible_bottom": 26
+  }
 }

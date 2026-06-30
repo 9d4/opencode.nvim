@@ -6,7 +6,7 @@ local base_picker = require('opencode.ui.base_picker')
 ---Format message parts for timeline picker
 ---@param msg OpencodeMessage Message object
 ---@return PickerItem
-function format_message_item(msg, width)
+local function format_message_item(msg, width)
   local preview = msg.parts and msg.parts[1] and msg.parts[1].text or ''
 
   local debug_text = 'ID: ' .. (msg.info.id or 'N/A')
@@ -41,7 +41,7 @@ function M.pick(messages, callback)
     actions = actions,
     callback = callback,
     title = 'Timeline',
-    width = config.ui.picker_width or 100,
+    width = config.ui.picker_width,
     layout_opts = config.ui.picker,
   })
 end

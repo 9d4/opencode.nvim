@@ -1,4 +1,3 @@
-local Path = require('plenary.path')
 local M = {}
 
 function M.uid()
@@ -326,8 +325,7 @@ function M.is_git_project()
     _is_git_project = false
     return _is_git_project
   end
-  local git_dir = Path:new(cwd):joinpath('.git')
-  _is_git_project = git_dir:exists()
+  _is_git_project = vim.fn.isdirectory(cwd .. '/.git') == 1
   return _is_git_project
 end
 
@@ -354,10 +352,10 @@ function M.format_cost(c)
 end
 
 function M.debounce(func, delay)
-  local timer = nil
+  local timer ---@type uv.uv_timer_t?
   return function(...)
-    if timer then
-      timer:stop()
+    if timer and not timer:is_closing() then
+      timer:close()
     end
     local args = { ... }
     timer = vim.defer_fn(function()

@@ -23,8 +23,11 @@ local slash_command_presets = {
   ['/variant'] = { name = 'variant' },
   ['/new'] = { name = 'session', preset_args = { 'new' } },
   ['/redo'] = { name = 'redo' },
-  ['/sessions'] = { name = 'session', preset_args = { 'select' } },
-  ['/share'] = { name = 'session', preset_args = { 'share' } },
+  ['/sessions']      = { name = 'session', preset_args = { 'select' } },
+  ['/skills']        = { name = 'skills' },
+  ['/share']         = { name = 'session', preset_args = { 'share' } },
+  ['/clear_selections'] = { name = 'clear_selections' },
+  ['/clear_files'] = { name = 'clear_files' },
   ['/timeline'] = { name = 'timeline' },
   ['/references'] = { name = 'references' },
   ['/undo'] = { name = 'undo' },
@@ -133,6 +136,30 @@ M.get_commands = Promise.async(function()
         fn = function(args)
           local cmd_args = vim.list_extend({ name }, args or {})
           return dispatch_parsed('command', cmd_args)
+        end,
+        args = true,
+      })
+    end
+  end
+
+  local state = require('opencode.state')
+  local ok, skills = pcall(function()
+    return state.api_client:list_skills():await()
+  end)
+  if ok and skills then
+    for _, skill in ipairs(skills) do
+      local skill_content = skill.content
+      table.insert(result, {
+        slash_cmd = '/' .. skill.name,
+        desc = skill.description or 'Skill',
+        fn = function(args)
+          local message = skill_content
+          if args and #args > 0 then
+            message = skill_content .. '\n\n' .. table.concat(args, ' ')
+          end
+          require('opencode.services.session_runtime').open({ new_session = false, focus = 'output' }):and_then(function()
+            return require('opencode.services.messaging').send_message(message, {})
+          end)
         end,
         args = true,
       })

@@ -34,6 +34,12 @@
 ---@field worktree string
 ---@field directory string
 
+---@class OpencodeSkill
+---@field name string
+---@field description string|nil
+---@field location string
+---@field content string
+
 ---@class OpencodeCommand
 ---@field description string
 ---@field agent string
@@ -126,8 +132,19 @@
 ---@field time { created: number, updated: number }
 ---@field id string
 ---@field parentID string|nil
+---@field agent string|nil
+---@field model { id: string, providerID: string, variant?: string }|nil
+---@field directory? string
 ---@field revert? SessionRevertInfo
 ---@field share? SessionShareInfo
+
+---@class SessionProjectInfo
+---@field id string
+---@field name? string
+---@field worktree string
+
+---@class GlobalSession : Session
+---@field project SessionProjectInfo|nil
 
 ---@class OpencodeKeymapEntry
 ---@field [1] string # Function name
@@ -152,6 +169,7 @@
 ---@field delete_session OpencodeKeymapEntry
 ---@field new_session OpencodeKeymapEntry
 ---@field rename_session OpencodeKeymapEntry
+---@field fork_session OpencodeKeymapEntry
 
 ---@class OpencodeTimelinePickerKeymap
 ---@field undo OpencodeKeymapEntry
@@ -206,7 +224,7 @@
 ---@field persist_state boolean
 ---@field zoom_width number
 ---@field float OpencodeUIFloatConfig
----@field picker_width number|nil # Default width for all pickers (nil uses current window width)
+---@field picker_width number|false|nil # Width for pickers. 0<w<=1 = fraction of screen; >1 = absolute columns; false = use picker backend defaults.
 ---@field display_model boolean
 ---@field display_context_size boolean
 ---@field display_cost boolean
@@ -252,9 +270,16 @@
 ---@field event_throttle_ms number
 ---@field event_collapsing boolean
 
+---@class OpencodeUIOutputToolsConfig
+---@field show_output boolean
+---@field show_reasoning_output boolean
+---@field use_folds boolean
+---@field fold_exclude (string|{server: string, tool: string})[]|nil
+---@field folding_threshold number
+
 ---@class OpencodeUIOutputConfig
 ---@field time_format string|nil # Custom os.date format for timestamps, e.g. '%m/%d %H:%M'. Uses fixed default when nil.
----@field tools { show_output: boolean, show_reasoning_output: boolean, use_folds: boolean, folding_threshold: number }
+---@field tools OpencodeUIOutputToolsConfig
 ---@field rendering OpencodeUIOutputRenderingConfig
 ---@field max_messages integer|nil
 ---@field always_scroll_to_bottom boolean
@@ -354,12 +379,13 @@
 ---@field fn? fun(args:string[]|nil):nil|Promise<any>|any
 
 ---@class OpencodeConfig
----@field preferred_picker 'telescope' | 'fzf' | 'mini.pick' | 'snacks' | 'select' | nil
+---@field preferred_picker 'telescope' | 'telescope.nvim' | 'fzf' | 'fzf-lua' | 'mini.pick' | 'snacks' | 'snacks.nvim' | 'select' | nil
 ---@field default_global_keymaps boolean
 ---@field default_mode 'build' | 'plan' | string -- Default mode
 ---@field default_system_prompt string | nil
 ---@field keymap_prefix string
 ---@field opencode_executable 'opencode' | string -- Command run for calling opencode
+---@field lock_session_to_directory boolean -- If true, active session is preserved across DirChanged events
 ---@field server OpencodeServerConfig -- Custom/external server configuration
 ---@field keymap OpencodeKeymap
 ---@field ui OpencodeUIConfig
@@ -367,8 +393,10 @@
 ---@field logging OpencodeLoggingConfig
 ---@field debug OpencodeDebugConfig
 ---@field prompt_guard? fun(mentioned_files: string[]): boolean
+---@field child_readonly boolean
 ---@field hooks OpencodeHooks
 ---@field quick_chat OpencodeQuickChatConfig
+---@field snapshot_path? string -- Override base path for snapshot storage (default: $XDG_DATA_HOME/opencode). Appends /snapshot/<project_id>/<worktree_hash>
 
 ---@class MessagePartState
 ---@field input TaskToolInput|BashToolInput|FileToolInput|TodoToolInput|GlobToolInput|GrepToolInput|WebFetchToolInput|ListToolInput|QuestionToolInput|ApplyPatchToolInput Input data for the tool

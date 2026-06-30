@@ -11,10 +11,16 @@ M._last_visible_bottom_by_win = {}
 M._was_at_bottom_by_win = {}
 M._prev_line_count_by_win = {}
 
+local OUTPUT_FOLD_FILLCHARS = {
+  fold = '-',
+  foldclose = '+',
+  foldopen = '-',
+  foldsep = '│',
+}
+
 local function build_fold_state(folds)
   local fold_state = {
     ranges = {},
-    starts = {},
   }
 
   for _, range in ipairs(folds or {}) do
@@ -23,51 +29,27 @@ local function build_fold_state(folds)
         from = range.from,
         to = range.to,
       }
-      fold_state.starts[#fold_state.starts + 1] = range.from
     end
   end
 
   table.sort(fold_state.ranges, function(a, b)
     return a.from < b.from
   end)
-  table.sort(fold_state.starts)
 
   return fold_state
 end
 
 ---@param buf integer
----@return { ranges: table<{from: integer, to: integer}>, starts: integer[] }
+---@return { ranges: table<{from: integer, to: integer}> }
 local function get_fold_state(buf)
   local ok, fold_state = pcall(vim.api.nvim_buf_get_var, buf, 'opencode_folds')
   if not ok or type(fold_state) ~= 'table' then
-    return { ranges = {}, starts = {} }
+    return { ranges = {} }
   end
-  if type(fold_state.ranges) == 'table' and type(fold_state.starts) == 'table' then
+  if type(fold_state.ranges) == 'table' then
     return fold_state
   end
   return build_fold_state(fold_state)
-end
-
----@param ranges table<{from: integer, to: integer}>
----@param line integer
----@return boolean
-local function line_in_fold(ranges, line)
-  local lo = 1
-  local hi = #ranges
-
-  while lo <= hi do
-    local mid = math.floor((lo + hi) / 2)
-    local range = ranges[mid]
-    if line < range.from then
-      hi = mid - 1
-    elseif line > range.to then
-      lo = mid + 1
-    else
-      return true
-    end
-  end
-
-  return false
 end
 
 local _update_depth = 0
@@ -104,8 +86,6 @@ end
 ---@return integer
 function M.create_buf()
   local output_buf = vim.api.nvim_create_buf(false, true)
-  local filetype = config.ui.output.filetype or 'opencode_output'
-  vim.api.nvim_set_option_value('filetype', filetype, { buf = output_buf })
 
   vim.api.nvim_buf_set_var(output_buf, 'opencode_folds', build_fold_state({}))
 
@@ -166,13 +146,37 @@ function M.is_at_bottom(win)
     return true
   end
 
+  local effective_bottom = M.get_effective_bottom_line(state.windows.output_buf, line_count)
+
   local ok2, cursor = pcall(vim.api.nvim_win_get_cursor, win)
   if not ok2 then
     return true
   end
 
   local prev_line_count = M._prev_line_count_by_win[win] or line_count
-  return cursor[1] >= prev_line_count or cursor[1] >= line_count
+  local prev_effective_bottom = M.get_effective_bottom_line(state.windows.output_buf, prev_line_count)
+  return cursor[1] >= prev_effective_bottom or cursor[1] >= effective_bottom
+end
+
+---@param buf integer
+---@param line_count? integer
+---@return integer
+function M.get_effective_bottom_line(buf, line_count)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return 0
+  end
+
+  line_count = line_count or vim.api.nvim_buf_line_count(buf)
+  if not line_count or line_count <= 0 then
+    return 0
+  end
+
+  local last_line = vim.api.nvim_buf_get_lines(buf, line_count - 1, line_count, false)[1]
+  if line_count > 1 and last_line == '' then
+    return line_count - 1
+  end
+
+  return line_count
 end
 
 ---@param win? integer
@@ -183,6 +187,17 @@ function M.get_visible_bottom_line(win)
     return nil
   end
   local ok, line = pcall(vim.fn.line, 'w$', win)
+  return (ok and line and line > 0) and line or nil
+end
+
+---@param win? integer
+---@return integer|nil
+function M.get_visible_top_line(win)
+  win = win or (state.windows and state.windows.output_win)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  local ok, line = pcall(vim.fn.line, 'w0', win)
   return (ok and line and line > 0) and line or nil
 end
 
@@ -233,6 +248,7 @@ function M.setup(windows)
   )
   window_options.set_window_option('wrap', true, windows.output_win, { save_original = true })
   window_options.set_window_option('linebreak', true, windows.output_win, { save_original = true })
+  pcall(window_options.set_window_option, 'smoothscroll', true, windows.output_win, { save_original = true })
   window_options.set_window_option('cursorline', false, windows.output_win, { save_original = true })
   window_options.set_window_option('number', false, windows.output_win, { save_original = true })
   window_options.set_window_option('relativenumber', false, windows.output_win, { save_original = true })
@@ -243,11 +259,19 @@ function M.setup(windows)
   window_options.set_buffer_option('swapfile', false, windows.output_buf)
   window_options.set_buffer_option('undofile', false, windows.output_buf)
   window_options.set_buffer_option('undolevels', -1, windows.output_buf)
-  window_options.set_window_option('foldmethod', 'expr', windows.output_win)
-  window_options.set_window_option('foldexpr', 'v:lua.opencode_fold_expr()', windows.output_win)
+  window_options.set_window_option('foldmethod', 'manual', windows.output_win)
   window_options.set_window_option('foldenable', true, windows.output_win)
   window_options.set_window_option('foldlevel', 0, windows.output_win)
   window_options.set_window_option('foldcolumn', '1', windows.output_win)
+  window_options.set_window_option(
+    'fillchars',
+    vim.api.nvim_get_option_value('fillchars', { win = windows.output_win }),
+    windows.output_win,
+    { save_original = true }
+  )
+  vim.api.nvim_win_call(windows.output_win, function()
+    vim.opt_local.fillchars:append(OUTPUT_FOLD_FILLCHARS)
+  end)
   window_options.set_window_option('foldtext', 'v:lua.opencode_fold_text()', windows.output_win)
 
   if config.ui.position ~= 'current' then
@@ -307,32 +331,6 @@ function M.update_dimensions(windows)
   pcall(vim.api.nvim_win_set_config, windows.output_win, { width = width })
 end
 
----Fold expression for the output buffer
----@return number
-function M.fold_expr()
-  local output_buf = nil
-
-  local windows = state.windows
-  if windows and windows.output_buf and vim.api.nvim_buf_is_valid(windows.output_buf) then
-    output_buf = windows.output_buf
-  else
-    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-      if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_has_var(buf, 'opencode_folds') then
-        output_buf = buf
-        break
-      end
-    end
-  end
-
-  if not output_buf then
-    return 0
-  end
-
-  local line = vim.v.lnum
-  local fold_state = get_fold_state(output_buf)
-  return line_in_fold(fold_state.ranges, line) and 1 or 0
-end
-
 ---Fold text for the output buffer
 ---@return string
 function M.fold_text()
@@ -363,7 +361,6 @@ function M.fold_text()
   return vim.fn.foldtext()
 end
 
-_G.opencode_fold_expr = M.fold_expr
 _G.opencode_fold_text = M.fold_text
 
 function M.get_open_fold_starts(win, buf)
@@ -404,32 +401,28 @@ function M.set_folds(fold_ranges)
   end
 
   local was_open = M.get_open_fold_starts(win, buf)
-
+  local preserve_view = not M.is_at_bottom(win)
   vim.api.nvim_buf_set_var(buf, 'opencode_folds', folds)
 
   vim.api.nvim_win_call(win, function()
-    local view = vim.fn.winsaveview()
-    vim.cmd('silent! normal! zx')
-    local prev_starts = {}
-    for _, start_line in ipairs(prev_folds.starts) do
-      prev_starts[start_line] = true
-    end
+    local view = preserve_view and vim.fn.winsaveview() or nil
 
+    local line_count = vim.api.nvim_buf_line_count(buf)
     for _, range in ipairs(folds.ranges) do
-      if not prev_starts[range.from] then
-        vim.fn.cursor(range.from, 1)
-        vim.cmd('silent! normal! zc')
+      if range.from <= line_count and range.to <= line_count then
+        vim.cmd(range.from .. ',' .. range.to .. 'fold')
       end
     end
 
     for _, range in ipairs(folds.ranges) do
       if was_open[range.from] then
-        vim.fn.cursor(range.from, 1)
-        vim.cmd('silent! normal! zo')
+        vim.cmd(range.from .. ',' .. range.to .. 'foldopen!')
       end
     end
 
-    vim.fn.winrestview(view)
+    if view then
+      vim.fn.winrestview(view)
+    end
   end)
 end
 
@@ -541,21 +534,19 @@ function M.clear_extmarks(start_line, end_line, clear_all)
   pcall(vim.api.nvim_buf_clear_namespace, windows.output_buf, clear_all and -1 or M.namespace, start_line, end_line)
 end
 
----Apply extmarks to the output buffer
+---Apply extmarks to any buffer (reusable for preview buffers)
+---@param bufnr integer Target buffer
 ---@param extmarks table<number, OutputExtmark[]> Extmarks indexed by line
 ---@param line_offset? integer Line offset to apply to extmarks, defaults to 0
-function M.set_extmarks(extmarks, line_offset)
+function M.apply_extmarks(bufnr, extmarks, line_offset)
   if not extmarks or type(extmarks) ~= 'table' then
     return
   end
-  local windows = state.windows
-  if not windows or not windows.output_buf or not vim.api.nvim_buf_is_valid(windows.output_buf) then
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
 
   line_offset = line_offset or 0
-
-  local output_buf = windows.output_buf
 
   local line_indices = vim.tbl_keys(extmarks)
   table.sort(line_indices)
@@ -584,9 +575,24 @@ function M.set_extmarks(extmarks, line_offset)
         end
       end
       ---@cast m vim.api.keyset.set_extmark
-      pcall(vim.api.nvim_buf_set_extmark, output_buf, M.namespace, target_line, start_col or 0, m)
+      pcall(vim.api.nvim_buf_set_extmark, bufnr, M.namespace, target_line, start_col or 0, m)
     end
   end
+end
+
+---Apply extmarks to the output buffer
+---@param extmarks table<number, OutputExtmark[]> Extmarks indexed by line
+---@param line_offset? integer Line offset to apply to extmarks, defaults to 0
+function M.set_extmarks(extmarks, line_offset)
+  if not extmarks or type(extmarks) ~= 'table' then
+    return
+  end
+  local windows = state.windows
+  if not windows or not windows.output_buf or not vim.api.nvim_buf_is_valid(windows.output_buf) then
+    return
+  end
+
+  M.apply_extmarks(windows.output_buf, extmarks, line_offset)
 end
 
 ---@param start_line integer
@@ -652,11 +658,31 @@ end
 function M.setup_keymaps(windows)
   local keymap = require('opencode.keymap')
   keymap.setup_window_keymaps(config.keymap.output_window, windows.output_buf)
+
+  -- When lazy-render is active, gg only reaches the top of rendered content.
+  -- Load all messages first so gg reaches the true start of history.
+  vim.keymap.set('n', 'gg', function()
+    local renderer = require('opencode.ui.renderer')
+    renderer.load_all_messages()
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  end, { buffer = windows.output_buf })
 end
 
 ---@param windows OpencodeWindowState
 ---@param group integer
 function M.setup_autocmds(windows, group)
+  local debounced_load_more_at_top
+
+  local function has_unrendered_messages()
+    local ctx = require('opencode.ui.renderer.ctx')
+    return ctx.lazy_render_count ~= nil and ctx.lazy_render_count < #(state.messages or {})
+  end
+
+  local function viewport_is_at_rendered_top()
+    local top_line = M.get_visible_top_line(windows.output_win)
+    return top_line ~= nil and top_line <= 3
+  end
+
   vim.api.nvim_create_autocmd('WinEnter', {
     group = group,
     buffer = windows.output_buf,
@@ -689,14 +715,59 @@ function M.setup_autocmds(windows, group)
       if pos then
         state.ui.set_cursor_position('output', pos)
       end
+
+      if debounced_load_more_at_top and has_unrendered_messages() and viewport_is_at_rendered_top() then
+        debounced_load_more_at_top()
+      end
     end,
   })
+
+  -- Lazy-render: load more messages when the viewport reaches the rendered top.
+  debounced_load_more_at_top = require('opencode.util').debounce(function()
+    local renderer = require('opencode.ui.renderer')
+    local render_state = require('opencode.ui.renderer.ctx').render_state
+    local top_line = M.get_visible_top_line(windows.output_win)
+    local anchor_msg_id = nil
+    local anchor_offset = 0
+
+    if top_line then
+      for _, msg in ipairs(state.messages or {}) do
+        local msg_id = msg.info and msg.info.id or ''
+        if not msg_id:match('^__opencode_') then
+          local rendered = render_state:get_message(msg_id)
+          if rendered and rendered.line_start and rendered.line_end and rendered.line_end >= top_line then
+            anchor_msg_id = msg_id
+            anchor_offset = math.max(0, top_line - rendered.line_start)
+            break
+          end
+        end
+      end
+    end
+
+    if renderer.load_more_messages() then
+      if anchor_msg_id then
+        local rendered = render_state:get_message(anchor_msg_id)
+        if rendered and rendered.line_start then
+          local restored_top = math.max(1, rendered.line_start + anchor_offset)
+          pcall(vim.api.nvim_win_set_cursor, windows.output_win, { restored_top, 0 })
+          pcall(vim.api.nvim_win_call, windows.output_win, function()
+            vim.cmd('normal! zt')
+          end)
+          return
+        end
+      end
+      pcall(vim.api.nvim_win_set_cursor, windows.output_win, { 1, 0 })
+    end
+  end, 150)
 
   vim.api.nvim_create_autocmd('WinScrolled', {
     group = group,
     buffer = windows.output_buf,
     callback = function()
       M.sync_cursor_with_viewport(windows.output_win)
+      if debounced_load_more_at_top and has_unrendered_messages() and viewport_is_at_rendered_top() then
+        debounced_load_more_at_top()
+      end
     end,
   })
 end

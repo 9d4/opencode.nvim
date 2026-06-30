@@ -1,5 +1,6 @@
 local state = require('opencode.state')
 local Dialog = require('opencode.ui.dialog')
+local session_scope = require('opencode.ui.session_scope')
 
 local M = {}
 
@@ -160,6 +161,8 @@ function M.remove_permission(permission_id)
   else
     M._setup_dialog() -- Setup dialog for next permission
   end
+
+  require('opencode.ui.renderer.events').render_permissions_display()
 end
 
 ---Get currently selected permission (always the first one now)
@@ -273,6 +276,10 @@ function M._setup_dialog()
   end
 
   local function on_select(index)
+    if M._processing then
+      return
+    end
+
     if not check_focused() then
       return
     end
@@ -283,23 +290,21 @@ function M._setup_dialog()
     end
 
     M._processing = true
-    require('opencode.ui.renderer.events').render_permissions_display()
-    M._clear_dialog()
 
     local api = require('opencode.api')
     local actions = { 'accept', 'deny', 'accept_all' }
     local action = actions[index]
 
-    vim.defer_fn(function()
+    vim.schedule(function()
       if action then
         local api_func = api['permission_' .. action]
         if api_func then
           api_func(permission)
         end
       end
-      M.remove_permission(permission.id)
       M._processing = false
-    end, 50)
+      M.remove_permission(permission.id)
+    end)
   end
 
   local function on_navigate()
@@ -345,37 +350,18 @@ function M.restore_pending_permissions(session_id)
     return Promise.new():resolve(nil)
   end
 
-  return state.api_client:list_permissions()
+  return state.api_client
+    :list_permissions()
     :and_then(function(permissions)
       if not permissions or type(permissions) ~= 'table' then
         return
       end
 
       local events = require('opencode.ui.renderer.events')
-      local render_state = require('opencode.ui.renderer.ctx').render_state
 
       for _, permission in ipairs(permissions) do
         if permission and permission.id then
-          -- Check if this permission belongs to the active session or
-          -- one of its child sessions (task tool).
-          local belongs = permission.sessionID == session_id
-          if not belongs and permission.sessionID and permission.sessionID ~= '' then
-            belongs = render_state:get_task_part_by_child_session(permission.sessionID) ~= nil
-          end
-          if not belongs then
-            local tool = permission.tool
-            local tool_message_id = tool and tool.messageID
-            if tool_message_id and state.messages then
-              for _, message in ipairs(state.messages) do
-                if message.info and message.info.id == tool_message_id then
-                  belongs = true
-                  break
-                end
-              end
-            end
-          end
-
-          if belongs and not is_resolved_permission(permission) then
+          if session_scope.belongs_to_session(permission, session_id) and not is_resolved_permission(permission) then
             -- Check if already queued (avoid duplicate)
             local already_queued = false
             for _, existing in ipairs(M._permission_queue) do

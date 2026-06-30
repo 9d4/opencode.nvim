@@ -322,7 +322,8 @@ end
 ---@param output_buf integer
 ---@return { input_win: integer, output_win: integer }
 local function open_float(input_buf, output_buf)
-  local output_config, input_config = float_layout.window_configs({ input_buf = input_buf, output_buf = output_buf }, true)
+  local output_config, input_config =
+    float_layout.window_configs({ input_buf = input_buf, output_buf = output_buf }, true)
   local output_win = float_layout.open_win(output_buf, true, output_config)
   local input_win = float_layout.open_win(input_buf, true, input_config)
 
@@ -388,6 +389,12 @@ function M.create_windows()
 
   windows.input_win = win_ids.input_win
   windows.output_win = win_ids.output_win
+
+  local filetype = config.ui.output.filetype or 'opencode_output'
+  vim.api.nvim_win_call(windows.output_win, function()
+    vim.api.nvim_set_option_value('filetype', filetype, { buf = buffers.output_buf })
+  end)
+
   windows.saved_width_ratio = state.last_window_width_ratio
 
   input_window.setup(windows)
@@ -406,7 +413,7 @@ end
 
 ---@param opts? { restore_position?: boolean, start_insert?: boolean }
 function M.focus_input(opts)
-  if state.active_session and state.active_session.parentID then
+  if state.active_session and state.active_session.parentID and config.child_readonly then
     return
   end
 
@@ -527,12 +534,13 @@ end
 
 ---@param sessions Session[]
 ---@param cb fun(session: Session|nil)
-function M.select_session(sessions, cb)
+---@param opts? { scope?: 'project' | 'global' }
+function M.select_session(sessions, cb, opts)
   local session_picker = require('opencode.ui.session_picker')
   local util = require('opencode.util')
   local picker = require('opencode.ui.picker')
 
-  local success = session_picker.pick(sessions, cb)
+  local success = session_picker.pick(sessions, cb, opts)
   if not success then
     picker.select(sessions, {
       prompt = '',
@@ -564,7 +572,7 @@ function M.toggle_pane()
   if state.windows and current_win == state.windows.input_win then
     output_window.focus_output(true)
   else
-    if state.active_session and state.active_session.parentID then
+    if state.active_session and state.active_session.parentID and config.child_readonly then
       return
     end
     input_window.focus_input()

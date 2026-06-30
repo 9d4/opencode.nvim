@@ -105,7 +105,31 @@ M.cycle_variant = Promise.async(function()
   model_state.set_variant(provider, model, next_variant)
 end)
 
+--- Apply mode and resolve its associated model from config.
+--- No session guards; callers are responsible for validation.
+---@param mode string
+local apply_mode = Promise.async(function(mode)
+  state.model.set_mode(mode)
+  local opencode_config = config_file.get_opencode_config():await() --[[@as OpencodeConfigFile]]
+
+  local agent_config = opencode_config and opencode_config.agent or {}
+  local mode_config = agent_config[mode] or {}
+
+  if state.user_mode_model_map[mode] then
+    state.model.set_model(state.user_mode_model_map[mode])
+  elseif mode_config.model and mode_config.model ~= '' then
+    state.model.set_model(mode_config.model)
+  elseif opencode_config and opencode_config.model and opencode_config.model ~= '' then
+    state.model.set_model(opencode_config.model)
+  end
+end)
+
 M.switch_to_mode = Promise.async(function(mode)
+  if state.active_session and state.active_session.parentID then
+    log.notify('Cannot switch agent in child session', vim.log.levels.WARN)
+    return false
+  end
+
   if not mode or mode == '' then
     log.notify('Mode cannot be empty', vim.log.levels.ERROR)
     return false
@@ -121,19 +145,7 @@ M.switch_to_mode = Promise.async(function(mode)
     return false
   end
 
-  state.model.set_mode(mode)
-  local opencode_config = config_file.get_opencode_config():await() --[[@as OpencodeConfigFile]]
-
-  local agent_config = opencode_config and opencode_config.agent or {}
-  local mode_config = agent_config[mode] or {}
-
-  if state.user_mode_model_map[mode] then
-    state.model.set_model(state.user_mode_model_map[mode])
-  elseif mode_config.model and mode_config.model ~= '' then
-    state.model.set_model(mode_config.model)
-  elseif opencode_config and opencode_config.model and opencode_config.model ~= '' then
-    state.model.set_model(opencode_config.model)
-  end
+  apply_mode(mode):await()
   return true
 end)
 
@@ -148,11 +160,13 @@ M.ensure_current_mode = Promise.async(function()
 
     local default_mode = require('opencode.config').default_mode
 
-    if default_mode and vim.tbl_contains(available_agents, default_mode) then
-      return M.switch_to_mode(default_mode):await()
-    else
-      return M.switch_to_mode(available_agents[1]):await()
-    end
+    local mode = (default_mode and vim.tbl_contains(available_agents, default_mode))
+        and default_mode
+      or available_agents[1]
+
+    -- Initialize directly; the child-session guard in switch_to_mode
+    -- is for user-initiated changes, not system initialization.
+    apply_mode(mode):await()
   end
   return true
 end)
@@ -166,7 +180,14 @@ M.initialize_current_model = Promise.async(function(opts)
   opts = opts or {}
 
   if opts.restore_from_messages and state.messages then
-    for i = #state.messages, 1, -1 do
+    -- Child sessions scan forward (first message is reliable);
+    -- parent sessions scan backward (most recent is current choice)
+    local is_child = state.active_session and state.active_session.parentID ~= nil
+    local start_idx, end_idx, step = #state.messages, 1, -1
+    if is_child then
+      start_idx, end_idx, step = 1, #state.messages, 1
+    end
+    for i = start_idx, end_idx, step do
       local msg = state.messages[i]
       if msg and msg.info and msg.info.modelID and msg.info.providerID then
         local model_str = msg.info.providerID .. '/' .. msg.info.modelID
@@ -174,8 +195,12 @@ M.initialize_current_model = Promise.async(function(opts)
           state.model.set_model(model_str)
         end
         if msg.info.mode and state.current_mode ~= msg.info.mode then
-          local available_agents = config_file.get_opencode_agents():await()
-          if vim.tbl_contains(available_agents, msg.info.mode) then
+          local should_restore_mode = is_child
+          if not should_restore_mode then
+            local available_agents = config_file.get_opencode_agents():await()
+            should_restore_mode = vim.tbl_contains(available_agents, msg.info.mode)
+          end
+          if should_restore_mode then
             state.model.set_mode(msg.info.mode)
           end
         end

@@ -17,6 +17,45 @@ M.separator = {
   '',
 }
 
+local compaction_divider_text =
+  '━━━━━━━━━━━━ Session compacted ━━━━━━━━━━━━'
+
+---@param part OpencodeMessagePart|nil
+---@return boolean
+local function is_compaction_part(part)
+  return part ~= nil and part.type == 'compaction'
+end
+
+---@param message OpencodeMessage
+---@return boolean
+local function is_pure_compaction_message(message)
+  if not message.info or message.info.role ~= 'user' or not message.parts or #message.parts == 0 then
+    return false
+  end
+
+  local has_compaction = false
+  for _, part in ipairs(message.parts) do
+    if is_compaction_part(part) then
+      has_compaction = true
+    else
+      return false
+    end
+  end
+
+  return has_compaction
+end
+
+---@param message OpencodeMessage
+---@return boolean
+local function is_compaction_summary_message(message)
+  local info = message.info
+  if not info or info.role ~= 'assistant' then
+    return false
+  end
+
+  return info.summary == true or info.mode == 'compaction' or info.agent == 'compaction'
+end
+
 ---@param output Output
 ---@param part OpencodeMessagePart
 function M._format_reasoning(output, part)
@@ -194,12 +233,25 @@ function M.format_message_header(message, previous_message)
     return output
   end
 
+  if is_pure_compaction_message(message) then
+    return output
+  end
+
+  if is_compaction_summary_message(message) then
+    return output
+  end
+
   local role = message.info.role or 'unknown'
   local icon = message.info.role == 'user' and icons.get('header_user') or icons.get('header_assistant')
 
   local time = message.info.time and message.info.time.created or nil
   local role_hl = 'OpencodeMessageRole' .. role:sub(1, 1):upper() .. role:sub(2)
-  local model_text = message.info.modelID and ' ' .. message.info.modelID or ''
+  local model_text = message.info.providerID
+      and message.info.modelID
+      and (message.info.providerID .. '/' .. message.info.modelID)
+    or message.info.providerID
+    or message.info.modelID
+    or ''
 
   local debug_text = config.debug.show_ids and ' [' .. message.info.id .. ']' or ''
 
@@ -252,6 +304,7 @@ function M.format_message_header(message, previous_message)
         { icon, role_hl },
         { ' ' },
         { display_name, role_hl },
+        { ' ' },
         { model_text, 'OpencodeHint' },
         { debug_text, 'OpencodeHint' },
       },
@@ -356,6 +409,12 @@ function M._format_user_prompt(output, text, message)
   end
 
   M.add_vertical_border(output, start_line, end_line + end_line_extmark_offset, 'OpencodeMessageRoleUser', -3)
+end
+
+---@param output Output
+local function format_compaction_divider(output)
+  output:add_line(compaction_divider_text)
+  output:add_extmark(output:get_line_count() - 1, { line_hl_group = 'OpencodeBorder', priority = 5000 })
 end
 
 ---@param output Output Output object to write to
@@ -592,8 +651,15 @@ function M.format_tool(output, part, get_child_parts)
 
   local start_line = output:get_line_count() + 1
 
-  local formatter = tool_formatters[tool] or tool_formatters.tool
+  local formatter = tool_formatters[tool] or (tool:match('_') and tool_formatters.mcp) or tool_formatters.tool
+  local fold_count = #output.fold_ranges
   formatter.format(output, part, get_child_parts)
+
+  if not format_utils.should_fold_tool(tool) then
+    for idx = #output.fold_ranges, fold_count + 1, -1 do
+      table.remove(output.fold_ranges, idx)
+    end
+  end
 
   if part.state.status == 'error' and part.state.error then
     output:add_line('')
@@ -646,10 +712,18 @@ function M.format_part(part, message, is_last_part, get_child_parts)
   end
 
   local content_added = false
+
+  if is_compaction_summary_message(message) and part.type ~= 'text' then
+    return output
+  end
+
   local role = message.info.role
 
   if role == 'user' then
-    if part.type == 'text' and part.text then
+    if is_compaction_part(part) then
+      format_compaction_divider(output)
+      content_added = true
+    elseif part.type == 'text' and part.text then
       if part.synthetic == true then
         part._message_context = message
         M._format_selection_context(output, part)

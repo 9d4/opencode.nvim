@@ -1,4 +1,3 @@
-local Path = require('plenary.path')
 local state = require('opencode.state')
 local snapshot = require('opencode.snapshot')
 local diff_tab = require('opencode.ui.diff_tab')
@@ -41,8 +40,8 @@ local git = {
       return M.__is_git_project
     end
 
-    local git_dir = Path:new(vim.fn.getcwd()):joinpath('.git')
-    M.__is_git_project = git_dir:exists() and git_dir:is_dir()
+    local git_dir = vim.fn.getcwd() .. '/.git'
+    M.__is_git_project = vim.fn.isdirectory(git_dir) == 1
 
     return M.__is_git_project
   end,
@@ -287,9 +286,7 @@ M.revert_selected_file = require_git_project(function(ref)
 end)
 
 M.revert_all = require_git_project(function(ref)
-  vim.print('⭕ ❱ git_review.lua:288 ❱ ƒ(anonymous) ❱ ref =', ref)
   M.__current_ref = ref or M.get_first_snapshot()
-  vim.print('⭕ ❱ git_review.lua:289 ❱ ƒ(M.__current_ref) ❱ M.__current_ref =', M.__current_ref)
 
   local files = get_changed_files()
 
